@@ -1,0 +1,14 @@
+**/build/
+**/.gradle/
+**/target/
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.res
+android/local.properties
+android/signing.properties
+android/*.jks
+work/
+dist/
