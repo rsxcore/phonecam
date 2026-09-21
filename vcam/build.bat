@@ -34,9 +34,10 @@ if errorlevel 1 (
 )
 
 echo [*] Compiling PhoneCam.dll ...
-cl /nologo /LD /O2 /EHsc /W3 /DUNICODE /D_UNICODE ^
+if not exist out mkdir out
+cl /nologo /LD /MT /O2 /EHsc /W3 /DUNICODE /D_UNICODE ^
     PhoneCamFilter.cpp ^
-    /Fe:PhoneCam.dll ^
+    /Fe:out\PhoneCam.dll ^
     /link /DEF:PhoneCamFilter.def ^
     ole32.lib oleaut32.lib uuid.lib strmiids.lib advapi32.lib user32.lib gdi32.lib
 

@@ -1,14 +1,5 @@
-//! PhoneCam server.
-//!
-//! At this stage the program does one thing: it draws a test pattern into the
-//! shared memory that `PhoneCam.dll` reads. That is deliberate. The virtual
-//! camera is the only genuinely hard part of this project, and proving it works
-//! on its own means that when the picture does not show up in Zoom we know the
-//! fault is in the filter rather than somewhere in the networking.
-//!
-//! The TCP listener that takes frames from the phone replaces `draw()` later;
-//! everything around it — the mapping, the header, the frame pacing — stays.
-
+mod mjpeg;
+mod video;
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
@@ -74,6 +65,7 @@ const FPS: u32 = 30;
 struct Shm {
     mapping: HANDLE,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
+    mutex: HANDLE,
 }
 
 impl Shm {
@@ -81,6 +73,20 @@ impl Shm {
         let name: Vec<u16> = SHM_NAME.encode_utf16().chain(std::iter::once(0)).collect();
 
         unsafe {
+            let mutex_name: Vec<u16> = r"Local\PhoneCam_Writer_v1"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mutex = windows::Win32::System::Threading::CreateMutexW(
+                None,
+                false,
+                PCWSTR(mutex_name.as_ptr()),
+            )
+            .map_err(|e| e.to_string())?;
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                let _ = CloseHandle(mutex);
+                return Err("PhoneCam is already connected in another window".into());
+            }
             let mapping = CreateFileMappingW(
                 windows::Win32::Foundation::INVALID_HANDLE_VALUE,
                 None,
@@ -91,13 +97,6 @@ impl Shm {
             )
             .map_err(|e| format!("CreateFileMappingW failed: {e}"))?;
 
-            // Another server is already running. Two writers would tear frames
-            // unpredictably, so refuse rather than quietly fight over it.
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                let _ = CloseHandle(mapping);
-                return Err("another phonecam-server is already running".into());
-            }
-
             let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, SHM_SIZE);
             if view.Value.is_null() {
                 let _ = CloseHandle(mapping);
@@ -107,7 +106,11 @@ impl Shm {
                 ));
             }
 
-            Ok(Self { mapping, view })
+            Ok(Self {
+                mapping,
+                view,
+                mutex,
+            })
         }
     }
 
@@ -115,7 +118,7 @@ impl Shm {
         self.view.Value as *mut u8
     }
 
-    fn header(&self) -> &mut Header {
+    fn header(&mut self) -> &mut Header {
         unsafe { &mut *(self.base() as *mut Header) }
     }
 
@@ -138,8 +141,10 @@ impl Shm {
 impl Drop for Shm {
     fn drop(&mut self) {
         unsafe {
+            self.frame_index().store(0, Ordering::SeqCst);
             let _ = UnmapViewOfFile(self.view);
             let _ = CloseHandle(self.mapping);
+            let _ = CloseHandle(self.mutex);
         }
     }
 }
@@ -238,15 +243,59 @@ fn draw(buf: &mut [u8], phase: f32) {
 
 // ---------------------------------------------------------------------------
 
+fn publish(shm: &Shm, pixels: &[u8]) {
+    let frame = shm.frame_index().load(Ordering::Relaxed) & !1;
+    let back = 1 - shm.active_buffer().load(Ordering::Relaxed).min(1);
+    shm.frame_index()
+        .store(frame.wrapping_add(1), Ordering::SeqCst);
+    unsafe {
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), shm.pixels(back), pixels.len());
+        let tick = windows::Win32::System::SystemInformation::GetTickCount();
+        std::ptr::write_volatile(shm.base().add(32) as *mut u32, tick);
+    }
+    shm.active_buffer().store(back, Ordering::Release);
+    // Zero is reserved for no signal, including at the 32-bit wraparound.
+    shm.frame_index()
+        .store(frame.wrapping_add(2).max(2), Ordering::Release);
+}
+fn status(path: &Option<String>, message: &str) {
+    println!("{message}");
+    if let Some(path) = path {
+        let _ = std::fs::write(path, message);
+    }
+}
 fn main() {
-    let shm = match Shm::create() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let value = |key: &str| {
+        args.iter()
+            .position(|a| a == key)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let status_path = value("--status");
+    let test = args.iter().any(|s| s == "--test");
+    let endpoint = if test {
+        None
+    } else {
+        match value("--url")
+            .ok_or("Use --url http://PHONE:8080/stream or --test".into())
+            .and_then(|v| mjpeg::Endpoint::parse(&v))
+        {
+            Ok(e) => Some(e),
+            Err(e) => {
+                status(&status_path, &e);
+                std::process::exit(1);
+            }
+        }
+    };
+    let mut shm = match Shm::create() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[-] {e}");
+            status(&status_path, &e);
             std::process::exit(1);
         }
     };
-
+    shm.frame_index().store(1, Ordering::SeqCst);
     {
         let hdr = shm.header();
         hdr.magic = MAGIC;
@@ -256,49 +305,106 @@ fn main() {
         hdr.stride = WIDTH * 4;
         hdr.format = FMT_BGRA;
         hdr.active_buffer = 0;
-        hdr.frame_index = 0; // must stay 0 until the first real frame is drawn
+        hdr.reserved = [0; 8];
     }
-
-    println!(
-        "[+] {SHM_NAME} ready — {WIDTH}x{HEIGHT} @ {FPS} fps, {:.1} MB",
-        SHM_SIZE as f64 / (1024.0 * 1024.0)
-    );
-    println!("    Open the camera in any app to see the test pattern.");
-    println!("    Ctrl+C to stop.");
-
-    let interval = Duration::from_micros(1_000_000 / FPS as u64);
-    let start = Instant::now();
-    let mut frame: u32 = 0;
-    let mut active: u32 = 0;
-
-    loop {
-        let tick = Instant::now();
-        let phase = start.elapsed().as_secs_f32();
-
-        // Draw into whichever buffer the filter is not reading. The odd counter
-        // is what tells it to sit this frame out.
-        let back = 1 - active;
-
-        frame = frame.wrapping_add(1);
-        shm.frame_index().store(frame, Ordering::Release); // odd: draw in progress
-
-        {
-            let buf = unsafe {
-                std::slice::from_raw_parts_mut(shm.pixels(back), (WIDTH * HEIGHT * 4) as usize)
-            };
-            draw(buf, phase);
+    shm.frame_index().store(0, Ordering::Release);
+    let mut pixels = vec![0; video::W * video::H * 4];
+    if test {
+        status(&status_path, "TEST - 1280 x 720 / 30 fps");
+        let start = Instant::now();
+        let mut deadline = Instant::now();
+        loop {
+            draw(&mut pixels, start.elapsed().as_secs_f32());
+            publish(&shm, &pixels);
+            deadline += Duration::from_nanos(1_000_000_000 / FPS as u64);
+            thread::sleep(deadline.saturating_duration_since(Instant::now()));
         }
-
-        // The pixels are whole; naming the buffer publishes them.
-        shm.active_buffer().store(back, Ordering::Release);
-
-        frame = frame.wrapping_add(1);
-        shm.frame_index().store(frame, Ordering::Release); // even: safe to read
-        active = back;
-
-        let spent = tick.elapsed();
-        if spent < interval {
-            thread::sleep(interval - spent);
+    }
+    // The socket reader continuously drains the network into a single slot.
+    // Decoding never causes a queue of increasingly old JPEG frames.
+    use std::sync::{Arc, Condvar, Mutex};
+    struct Slot {
+        packet: Option<mjpeg::Packet>,
+        error: Option<String>,
+    }
+    let shared = Arc::new((
+        Mutex::new(Slot {
+            packet: None,
+            error: None,
+        }),
+        Condvar::new(),
+    ));
+    let network = shared.clone();
+    let endpoint = endpoint.unwrap();
+    thread::spawn(move || loop {
+        let result = (|| -> Result<(), String> {
+            let mut stream = endpoint.connect()?;
+            loop {
+                let packet = stream.next().map_err(|e| e.to_string())?;
+                let mut slot = network.0.lock().unwrap();
+                slot.packet = Some(packet);
+                slot.error = None;
+                network.1.notify_one();
+            }
+        })();
+        {
+            let mut slot = network.0.lock().unwrap();
+            slot.packet = None;
+            slot.error = result.err();
+            network.1.notify_one();
+        }
+        thread::sleep(Duration::from_secs(1));
+    });
+    status(&status_path, "Connecting to phone...");
+    let mut last_report = Instant::now();
+    let mut frames = 0;
+    let mut last_error = String::new();
+    let mut decode_ms = 0.0;
+    loop {
+        let (packet, error) = {
+            let slot = shared.0.lock().unwrap();
+            let (mut slot, _) = shared
+                .1
+                .wait_timeout_while(slot, Duration::from_secs(1), |s| {
+                    s.packet.is_none() && s.error.is_none()
+                })
+                .unwrap();
+            (slot.packet.take(), slot.error.take())
+        };
+        if let Some(e) = error {
+            shm.frame_index().store(0, Ordering::SeqCst);
+            if last_error != e {
+                status(&status_path, &format!("Reconnecting: {e}"));
+                last_error = e;
+            }
+        }
+        if let Some(packet) = packet {
+            let begin = Instant::now();
+            match video::decode(&packet.jpeg, packet.rotation, &mut pixels) {
+                Ok((w, h)) => {
+                    publish(&shm, &pixels);
+                    frames += 1;
+                    decode_ms += begin.elapsed().as_secs_f64() * 1000.0;
+                    if !last_error.is_empty() || last_report.elapsed() >= Duration::from_secs(1) {
+                        status(
+                            &status_path,
+                            &format!(
+                                "LIVE - {w} x {h} / {:.1} fps / {:.1} ms decode",
+                                frames as f64 / last_report.elapsed().as_secs_f64(),
+                                decode_ms / frames as f64
+                            ),
+                        );
+                        frames = 0;
+                        decode_ms = 0.0;
+                        last_report = Instant::now();
+                        last_error.clear();
+                    }
+                }
+                Err(e) => {
+                    shm.frame_index().store(0, Ordering::SeqCst);
+                    status(&status_path, &format!("Invalid video: {e}"));
+                }
+            }
         }
     }
 }

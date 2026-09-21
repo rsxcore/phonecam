@@ -12,3 +12,5 @@ android/signing.properties
 android/*.jks
 work/
 dist/
+__pycache__/
+*.pyc

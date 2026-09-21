@@ -39,7 +39,7 @@ static const wchar_t kPinName[] = L"Capture";
  * so 1080p leads; the phone can always send something smaller and get scaled. */
 static const struct {
     UINT w, h;
-} kCaps[] = {{1920, 1080}, {1280, 720}, {640, 480}};
+} kCaps[] = {{1280, 720}, {1920, 1080}, {640, 480}};
 static const int kCapCount = (int)(sizeof(kCaps) / sizeof(kCaps[0]));
 
 static const UINT kDefaultWidth = 1280;
@@ -47,6 +47,8 @@ static const UINT kDefaultHeight = 720;
 static const UINT kFps = 30;
 
 static HINSTANCE g_hInst = NULL;
+static LONG g_cLockedObjects = 0;
+static LONG g_cServerLocks = 0;
 
 /* ------------------------------------------------------------------ */
 /* Small COM helpers                                                   */
@@ -73,7 +75,10 @@ static bool IsAcceptableFormat(const AM_MEDIA_TYPE* pmt) {
     if (pmt->majortype != MEDIATYPE_Video) return false;
     if (pmt->formattype != FORMAT_VideoInfo) return false;
     if (pmt->subtype != MEDIASUBTYPE_RGB32) return false;
-    if (pmt->cbFormat < sizeof(VIDEOINFOHEADER)) return false;
+    if (pmt->cbFormat < sizeof(VIDEOINFOHEADER) || !pmt->pbFormat) return false;
+    const BITMAPINFOHEADER& b = ((VIDEOINFOHEADER*)pmt->pbFormat)->bmiHeader;
+    if (b.biWidth <= 0 || b.biWidth > 1920 || b.biHeight == 0 || b.biHeight < -1080 || b.biHeight > 1080) return false;
+    if (b.biPlanes != 1 || b.biBitCount != 32 || b.biCompression != BI_RGB) return false;
     return true;
 }
 
@@ -161,7 +166,7 @@ static void BlitScaled(BYTE* dst, UINT dstStride, UINT dstW, UINT dstH,
 
     const double invScale = 1.0 / scale;
     for (UINT y = 0; y < outH; ++y) {
-        const double sy = (y + 0.5) * invScale - 0.5;
+        const double sy = max(0.0, min((double)srcH - 1, (y + 0.5) * invScale - 0.5));
         int y0 = (int)sy;
         if (y0 < 0) y0 = 0;
         int y1 = y0 + 1;
@@ -174,7 +179,7 @@ static void BlitScaled(BYTE* dst, UINT dstStride, UINT dstW, UINT dstH,
         UINT32* out = (UINT32*)(dst + (size_t)(y + offY) * dstStride) + offX;
 
         for (UINT x = 0; x < outW; ++x) {
-            const double sx = (x + 0.5) * invScale - 0.5;
+            const double sx = max(0.0, min((double)srcW - 1, (x + 0.5) * invScale - 0.5));
             int x0 = (int)sx;
             if (x0 < 0) x0 = 0;
             int x1 = x0 + 1;
@@ -326,6 +331,7 @@ class PhoneCamPin : public IPin, public IAMStreamConfig, public IKsPropertySet {
     AM_MEDIA_TYPE m_mt; /* connection type; only valid while connected */
 
     UINT m_width, m_height, m_stride;
+    bool m_bottomUp;
     UINT m_srcWidth, m_srcHeight, m_srcStride;
 
     HANDLE m_hMap;
@@ -450,9 +456,9 @@ STDMETHODIMP EnumPins::Clone(IEnumPins** ppEnum) {
 /* EnumMediaTypes implementation                                       */
 /* ------------------------------------------------------------------ */
 
-EnumMediaTypes::EnumMediaTypes() : m_ref(1), m_pos(0) {}
+EnumMediaTypes::EnumMediaTypes() : m_ref(1), m_pos(0) { InterlockedIncrement(&g_cLockedObjects); }
 
-EnumMediaTypes::~EnumMediaTypes() {}
+EnumMediaTypes::~EnumMediaTypes() { InterlockedDecrement(&g_cLockedObjects); }
 
 STDMETHODIMP EnumMediaTypes::QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
@@ -531,6 +537,7 @@ PhoneCamPin::PhoneCamPin(PhoneCamFilter* pFilter, HRESULT* phr)
       m_width(kDefaultWidth),
       m_height(kDefaultHeight),
       m_stride(kDefaultWidth * 4),
+      m_bottomUp(false),
       m_srcWidth(0),
       m_srcHeight(0),
       m_srcStride(0),
@@ -570,13 +577,11 @@ STDMETHODIMP PhoneCamPin::QueryInterface(REFIID riid, void** ppv) {
 }
 
 STDMETHODIMP_(ULONG) PhoneCamPin::AddRef() {
-    return (ULONG)InterlockedIncrement(&m_ref);
+    return m_pFilter->AddRef();
 }
 
 STDMETHODIMP_(ULONG) PhoneCamPin::Release() {
-    const LONG r = InterlockedDecrement(&m_ref);
-    if (r == 0) delete this;
-    return (ULONG)r;
+    return m_pFilter->Release();
 }
 
 STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
@@ -590,6 +595,10 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
     if (pmt) {
         if (!IsAcceptableFormat(pmt)) return VFW_E_TYPE_NOT_ACCEPTED;
         chosen = *pmt;
+        chosen.pbFormat = (BYTE*)CoTaskMemAlloc(pmt->cbFormat);
+        if (!chosen.pbFormat) return E_OUTOFMEMORY;
+        memcpy(chosen.pbFormat, pmt->pbFormat, pmt->cbFormat);
+        if (chosen.pUnk) chosen.pUnk->AddRef();
     } else {
         FillVideoInfoHeader(&chosen, m_width, m_height);
         if (!chosen.pbFormat) return E_OUTOFMEMORY;
@@ -599,14 +608,14 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
     const UINT w = (UINT)vih->bmiHeader.biWidth;
     const UINT h = (UINT)abs(vih->bmiHeader.biHeight);
     if (w == 0 || h == 0 || w > PHONECAM_MAX_WIDTH || h > PHONECAM_MAX_HEIGHT) {
-        if (!pmt) FreeMediaTypeContents(&chosen);
+        FreeMediaTypeContents(&chosen);
         return VFW_E_TYPE_NOT_ACCEPTED;
     }
 
     HRESULT hr = CoCreateInstance(CLSID_MemoryAllocator, NULL, CLSCTX_INPROC_SERVER,
                                   IID_IMemAllocator, (void**)&m_pAllocator);
     if (FAILED(hr)) {
-        if (!pmt) FreeMediaTypeContents(&chosen);
+        FreeMediaTypeContents(&chosen);
         return hr;
     }
 
@@ -619,7 +628,7 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
     if (FAILED(hr)) {
         m_pAllocator->Release();
         m_pAllocator = NULL;
-        if (!pmt) FreeMediaTypeContents(&chosen);
+        FreeMediaTypeContents(&chosen);
         return hr;
     }
 
@@ -627,7 +636,7 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
     if (FAILED(hr)) {
         m_pAllocator->Release();
         m_pAllocator = NULL;
-        if (!pmt) FreeMediaTypeContents(&chosen);
+        FreeMediaTypeContents(&chosen);
         return hr;
     }
 
@@ -636,7 +645,7 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
         pReceivePin->Disconnect();
         m_pAllocator->Release();
         m_pAllocator = NULL;
-        if (!pmt) FreeMediaTypeContents(&chosen);
+        FreeMediaTypeContents(&chosen);
         return hr;
     }
 
@@ -647,7 +656,7 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
         m_pDownstreamInput = NULL;
         m_pAllocator->Release();
         m_pAllocator = NULL;
-        if (!pmt) FreeMediaTypeContents(&chosen);
+        FreeMediaTypeContents(&chosen);
         return hr;
     }
 
@@ -655,12 +664,9 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
      * buffers, it only reads them. */
     m_pDownstreamInput->NotifyAllocator(m_pAllocator, TRUE);
 
-    if (pmt) {
-        FreeMediaTypeContents(&m_mt);
-        m_mt = chosen;
-    } else {
-        m_mt = chosen; /* ownership transferred to us */
-    }
+    FreeMediaTypeContents(&m_mt);
+    m_mt = chosen;
+    m_bottomUp = vih->bmiHeader.biHeight > 0;
 
     m_width = w;
     m_height = h;
@@ -829,13 +835,10 @@ STDMETHODIMP PhoneCamPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt,
     if (!ppmt || !pSCC) return E_POINTER;
     if (iIndex < 0 || iIndex >= kCapCount) return S_FALSE;
 
-    /* Callers disagree about who allocates the AM_MEDIA_TYPE: some pass an
-     * uninitialised pointer, some pre-allocate. Honour both. */
-    AM_MEDIA_TYPE* pmt = *ppmt;
-    if (!pmt) {
-        pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
-        if (!pmt) return E_OUTOFMEMORY;
-    }
+    // IAMStreamConfig specifies an out pointer: never read its initial value.
+    *ppmt = NULL;
+    AM_MEDIA_TYPE* pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
+    if (!pmt) return E_OUTOFMEMORY;
     ZeroMemory(pmt, sizeof(*pmt));
     FillVideoInfoHeader(pmt, kCaps[iIndex].w, kCaps[iIndex].h);
     if (!pmt->pbFormat) {
@@ -863,7 +866,7 @@ STDMETHODIMP PhoneCamPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt,
     caps->MaxOutputSize.cy = kCaps[iIndex].h;
     caps->OutputGranularityX = 1;
     caps->OutputGranularityY = 1;
-    caps->MinFrameInterval = 10000000LL / 60;
+    caps->MinFrameInterval = 10000000LL / kFps;
     caps->MaxFrameInterval = 10000000LL / kFps;
     caps->MinBitsPerSecond = (LONG)(kCaps[iIndex].w * kCaps[iIndex].h * 4 * 8 * kFps / 4);
     caps->MaxBitsPerSecond = (LONG)(kCaps[iIndex].w * kCaps[iIndex].h * 4 * 8 * kFps);
@@ -907,7 +910,7 @@ bool PhoneCamPin::OpenSharedMemory() {
     if (m_pView) return true;
     m_hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, PHONECAM_SHM_NAME);
     if (!m_hMap) return false;
-    m_pView = (BYTE*)MapViewOfFile(m_hMap, FILE_MAP_READ, 0, 0, 0);
+    m_pView = (BYTE*)MapViewOfFile(m_hMap, FILE_MAP_READ, 0, 0, PHONECAM_SHM_SIZE);
     if (!m_pView) {
         CloseHandle(m_hMap);
         m_hMap = NULL;
@@ -935,46 +938,28 @@ bool PhoneCamPin::CopyLatestFrame(BYTE* dst, UINT dstStride, UINT dstW, UINT dst
     if (hdr->version != PHONECAM_VERSION) return false;
     if (hdr->format != PHONECAM_FMT_BGRA) return false;
 
-    const UINT w = hdr->width;
-    const UINT h = hdr->height;
-    const UINT s = hdr->stride;
-    if (w == 0 || h == 0) return false;
-    if (w > PHONECAM_MAX_WIDTH || h > PHONECAM_MAX_HEIGHT) return false;
-    if (s < w * 4) return false;
-
-    /* A publish cycle moves frameIndex by two: it goes odd while the producer
-     * draws, then even once the new buffer is active. The producer only ever
-     * touches the inactive buffer, so if the counter has advanced by less than
-     * two the buffer we copied cannot have been written under us. Damage needs
-     * the counter to have moved further than that, which takes a whole cycle. */
-    const int kAttempts = 4;
-    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+    // The producer can disappear while readers keep the mapping alive.
+    // A monotonic heartbeat avoids displaying a frozen face indefinitely.
+    for (int attempt = 0; attempt < 4; ++attempt) {
         const UINT32 before = hdr->frameIndex;
-        if (before == 0) return false; /* producer has not drawn yet */
-        if (before & 1u) continue;     /* a write is in progress */
-
-        const UINT32 which = hdr->activeBuffer;
-        if (which >= PHONECAM_BUFFERS) return false;
-
+        if (!before) return false;
+        if (before & 1u) continue;
         MemoryBarrier();
+        const UINT w = hdr->width, h = hdr->height, s = hdr->stride;
+        const UINT32 which = hdr->activeBuffer;
+        if (!w || !h || w > PHONECAM_MAX_WIDTH || h > PHONECAM_MAX_HEIGHT ||
+            s < w * 4 || (UINT64)s * h > PHONECAM_BUF_BYTES || which >= PHONECAM_BUFFERS) return false;
+        if ((DWORD)(GetTickCount() - hdr->reserved[0]) > 2500) return false;
         const BYTE* src = m_pView + PHONECAM_BUF_OFFSET(which);
         BlitScaled(dst, dstStride, dstW, dstH, src, w, h, s);
-
         MemoryBarrier();
-        if (hdr->frameIndex <= before + 1u) {
-            m_srcWidth = w;
-            m_srcHeight = h;
-            m_srcStride = s;
+        if (hdr->frameIndex == before) {
+            m_srcWidth = w; m_srcHeight = h; m_srcStride = s;
             return true;
         }
     }
-    /* Losing four races in a row would mean the producer is writing far faster
-     * than we can copy. Rather than hand the app nothing, keep the last copy —
-     * a torn frame beats a frozen one. */
-    m_srcWidth = w;
-    m_srcHeight = h;
-    m_srcStride = s;
-    return true;
+    return false; // Never publish a copy known to have raced the producer.
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -984,6 +969,7 @@ bool PhoneCamPin::CopyLatestFrame(BYTE* dst, UINT dstStride, UINT dstW, UINT dst
 void PhoneCamPin::StartStreaming() {
     if (m_hThread) return;
     if (!m_pAllocator || !m_pDownstreamInput) return;
+    m_pAllocator->Commit();
     ResetEvent(m_hStop);
     m_rtNext = 0;
     m_hThread = CreateThread(NULL, 0, &PhoneCamPin::ThreadEntry, this, 0, NULL);
@@ -992,7 +978,12 @@ void PhoneCamPin::StartStreaming() {
 void PhoneCamPin::StopStreaming() {
     if (!m_hThread) return;
     SetEvent(m_hStop);
-    WaitForSingleObject(m_hThread, 2000);
+    // Wake blocking allocator/Receive calls before joining. Never destroy a
+    // pin while its worker still has a raw pointer to it.
+    if (m_pDownstream) m_pDownstream->BeginFlush();
+    if (m_pAllocator) m_pAllocator->Decommit();
+    WaitForSingleObject(m_hThread, INFINITE);
+    if (m_pDownstream) m_pDownstream->EndFlush();
     CloseHandle(m_hThread);
     m_hThread = NULL;
 }
@@ -1003,15 +994,17 @@ DWORD WINAPI PhoneCamPin::ThreadEntry(LPVOID param) {
 }
 
 void PhoneCamPin::StreamLoop() {
-    const DWORD interval = 1000 / kFps;
+    LARGE_INTEGER frequency, start;
+    QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&start);
+    UINT64 frame = 0;
     for (;;) {
-        const DWORD started = GetTickCount();
         DeliverOneFrame();
-        if (WaitForSingleObject(m_hStop, 0) != WAIT_TIMEOUT) break;
-        const DWORD elapsed = GetTickCount() - started;
-        if (elapsed < interval) {
-            if (WaitForSingleObject(m_hStop, interval - elapsed) != WAIT_TIMEOUT) break;
-        }
+        ++frame;
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        const LONGLONG due = start.QuadPart + frame * frequency.QuadPart / kFps;
+        const DWORD wait = due > now.QuadPart ? (DWORD)((due - now.QuadPart) * 1000 / frequency.QuadPart) : 0;
+        if (WaitForSingleObject(m_hStop, wait) != WAIT_TIMEOUT) break;
+        if (now.QuadPart > due + frequency.QuadPart) { start = now; frame = 0; }
     }
 }
 
@@ -1040,6 +1033,13 @@ void PhoneCamPin::DeliverOneFrame() {
         if (!m_pView || !CopyLatestFrame(dst, m_stride, m_width, m_height)) {
             FillNoSignal(dst, m_stride, m_width, m_height);
         }
+        if (m_bottomUp) {
+            for (UINT y = 0; y < m_height / 2; ++y) {
+                BYTE* top = dst + y * m_stride;
+                BYTE* bottom = dst + (m_height - 1 - y) * m_stride;
+                for (UINT x = 0; x < m_stride; ++x) { const BYTE p = top[x]; top[x] = bottom[x]; bottom[x] = p; }
+            }
+        }
         pSample->SetActualDataLength((long)(m_stride * m_height));
         pSample->SetSyncPoint(TRUE);
         pSample->SetPreroll(FALSE);
@@ -1057,14 +1057,15 @@ void PhoneCamPin::DeliverOneFrame() {
 
 PhoneCamFilter::PhoneCamFilter(HRESULT* phr)
     : m_ref(1), m_pPin(NULL), m_pGraph(NULL), m_pClock(NULL), m_state(State_Stopped) {
+    InterlockedIncrement(&g_cLockedObjects);
     m_pPin = new PhoneCamPin(this, phr);
     if (!m_pPin && phr) *phr = E_OUTOFMEMORY;
 }
 
 PhoneCamFilter::~PhoneCamFilter() {
-    if (m_pGraph) m_pGraph->Release();
     if (m_pClock) m_pClock->Release();
-    if (m_pPin) m_pPin->Release();
+    delete m_pPin;
+    InterlockedDecrement(&g_cLockedObjects);
 }
 
 STDMETHODIMP PhoneCamFilter::QueryInterface(REFIID riid, void** ppv) {
@@ -1120,7 +1121,7 @@ STDMETHODIMP PhoneCamFilter::GetState(DWORD dwMilliSecsTimeout, FILTER_STATE* pS
     (void)dwMilliSecsTimeout;
     if (!pState) return E_POINTER;
     *pState = m_state;
-    return S_OK;
+    return m_state == State_Paused ? VFW_S_CANT_CUE : S_OK;
 }
 
 STDMETHODIMP PhoneCamFilter::SetSyncSource(IReferenceClock* pClock) {
@@ -1167,9 +1168,8 @@ STDMETHODIMP PhoneCamFilter::QueryFilterInfo(FILTER_INFO* pInfo) {
 
 STDMETHODIMP PhoneCamFilter::JoinFilterGraph(IFilterGraph* pGraph, LPCWSTR pName) {
     (void)pName;
-    if (m_pGraph) m_pGraph->Release();
+    // The graph owns the filter; a reverse strong reference would leak both.
     m_pGraph = pGraph;
-    if (m_pGraph) m_pGraph->AddRef();
     return S_OK;
 }
 
@@ -1185,7 +1185,8 @@ STDMETHODIMP PhoneCamFilter::QueryVendorInfo(LPWSTR* pVendorInfo) {
 
 class PhoneCamClassFactory : public IClassFactory {
   public:
-    PhoneCamClassFactory() : m_ref(1) {}
+    PhoneCamClassFactory() : m_ref(1) { InterlockedIncrement(&g_cLockedObjects); }
+    ~PhoneCamClassFactory() { InterlockedDecrement(&g_cLockedObjects); }
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
         if (!ppv) return E_POINTER;
@@ -1211,13 +1212,14 @@ class PhoneCamClassFactory : public IClassFactory {
         HRESULT hr = S_OK;
         PhoneCamFilter* pFilter = new PhoneCamFilter(&hr);
         if (!pFilter) return E_OUTOFMEMORY;
+        if (FAILED(hr)) { pFilter->Release(); return hr; }
         hr = pFilter->QueryInterface(riid, ppv);
         pFilter->Release();
         return hr;
     }
 
     STDMETHODIMP LockServer(BOOL bLock) {
-        (void)bLock;
+        if (bLock) InterlockedIncrement(&g_cServerLocks); else InterlockedDecrement(&g_cServerLocks);
         return S_OK;
     }
 
@@ -1229,8 +1231,7 @@ class PhoneCamClassFactory : public IClassFactory {
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
 
-static LONG g_cLockedObjects = 0;
-static LONG g_cServerLocks = 0;
+
 
 static HRESULT SetKeyValue(HKEY hKey, LPCWSTR sub, LPCWSTR name, LPCWSTR value) {
     HKEY hSub = NULL;
@@ -1260,30 +1261,30 @@ STDAPI DllRegisterServer() {
     wchar_t szKey[256];
     HRESULT hr;
 
-    wsprintfW(szKey, L"CLSID\\%s", szClsid);
-    hr = SetKeyValue(HKEY_CLASSES_ROOT, szKey, NULL, kFilterName);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s", szClsid);
+    hr = SetKeyValue(HKEY_CURRENT_USER, szKey, NULL, kFilterName);
     if (FAILED(hr)) return hr;
 
-    wsprintfW(szKey, L"CLSID\\%s\\InprocServer32", szClsid);
-    hr = SetKeyValue(HKEY_CLASSES_ROOT, szKey, NULL, szModule);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s\\InprocServer32", szClsid);
+    hr = SetKeyValue(HKEY_CURRENT_USER, szKey, NULL, szModule);
     if (FAILED(hr)) return hr;
-    hr = SetKeyValue(HKEY_CLASSES_ROOT, szKey, L"ThreadingModel", L"Both");
+    hr = SetKeyValue(HKEY_CURRENT_USER, szKey, L"ThreadingModel", L"Both");
     if (FAILED(hr)) return hr;
 
     /* The Instance key is what makes it show up as a *device*. */
-    wsprintfW(szKey, L"CLSID\\%s\\Instance", szClsid);
-    hr = SetKeyValue(HKEY_CLASSES_ROOT, szKey, L"CLSID", szClsid);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s\\Instance", szClsid);
+    hr = SetKeyValue(HKEY_CURRENT_USER, szKey, L"CLSID", szClsid);
     if (FAILED(hr)) return hr;
-    hr = SetKeyValue(HKEY_CLASSES_ROOT, szKey, L"FriendlyName", kFilterName);
+    hr = SetKeyValue(HKEY_CURRENT_USER, szKey, L"FriendlyName", kFilterName);
     if (FAILED(hr)) return hr;
 
     /* ...and this one files it under "video input devices". */
     wchar_t szCategory[64];
     GuidToString(CLSID_VideoInputDeviceCategory, szCategory);
-    wsprintfW(szKey, L"CLSID\\%s\\Instance\\%s", szCategory, szClsid);
-    hr = SetKeyValue(HKEY_CLASSES_ROOT, szKey, L"CLSID", szClsid);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s\\Instance\\%s", szCategory, szClsid);
+    hr = SetKeyValue(HKEY_CURRENT_USER, szKey, L"CLSID", szClsid);
     if (FAILED(hr)) return hr;
-    hr = SetKeyValue(HKEY_CLASSES_ROOT, szKey, L"FriendlyName", kFilterName);
+    hr = SetKeyValue(HKEY_CURRENT_USER, szKey, L"FriendlyName", kFilterName);
     if (FAILED(hr)) return hr;
 
     return S_OK;
@@ -1297,17 +1298,17 @@ STDAPI DllUnregisterServer() {
     GuidToString(CLSID_VideoInputDeviceCategory, szCategory);
 
     wchar_t szKey[256];
-    wsprintfW(szKey, L"CLSID\\%s\\Instance\\%s", szCategory, szClsid);
-    RegDeleteKeyW(HKEY_CLASSES_ROOT, szKey);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s\\Instance\\%s", szCategory, szClsid);
+    RegDeleteKeyW(HKEY_CURRENT_USER, szKey);
 
-    wsprintfW(szKey, L"CLSID\\%s\\Instance", szClsid);
-    RegDeleteKeyW(HKEY_CLASSES_ROOT, szKey);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s\\Instance", szClsid);
+    RegDeleteKeyW(HKEY_CURRENT_USER, szKey);
 
-    wsprintfW(szKey, L"CLSID\\%s\\InprocServer32", szClsid);
-    RegDeleteKeyW(HKEY_CLASSES_ROOT, szKey);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s\\InprocServer32", szClsid);
+    RegDeleteKeyW(HKEY_CURRENT_USER, szKey);
 
-    wsprintfW(szKey, L"CLSID\\%s", szClsid);
-    RegDeleteKeyW(HKEY_CLASSES_ROOT, szKey);
+    wsprintfW(szKey, L"Software\\Classes\\CLSID\\%s", szClsid);
+    RegDeleteKeyW(HKEY_CURRENT_USER, szKey);
 
     return S_OK;
 }
@@ -1327,7 +1328,7 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv) {
 }
 
 STDAPI DllCanUnloadNow() {
-    return (g_cLockedObjects == 0 && g_cServerLocks == 0) ? S_OK : S_FALSE;
+    return (InterlockedCompareExchange(&g_cLockedObjects, 0, 0) == 0 && InterlockedCompareExchange(&g_cServerLocks, 0, 0) == 0) ? S_OK : S_FALSE;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {

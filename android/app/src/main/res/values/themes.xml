@@ -1,5 +1,1 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-
-    <style name="Theme.PhoneCam" parent="android:Theme.Material.Light.NoActionBar" />
-</resources>
+<resources><style name="Theme.PhoneCam" parent="android:Theme.Material.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:colorAccent">#5BDCB4</item><item name="android:windowLightStatusBar">false</item><item name="android:navigationBarColor">#101820</item></style></resources>

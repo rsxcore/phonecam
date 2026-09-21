@@ -1,228 +1,133 @@
 package com.phonecam
 
 import java.io.BufferedOutputStream
-import java.io.IOException
+import java.io.InputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
-/**
- * Serves the camera as MJPEG over HTTP.
- *
- * HTTP rather than a bespoke framing, because a browser renders
- * `multipart/x-mixed-replace` inside a plain `<img>` tag with no client-side
- * code at all. That means the phone can be checked from the PC before any
- * server exists — and the Rust side later reads exactly the bytes the browser
- * already proved were correct, so there is only ever one transport to debug.
- *
- * GET /         a page with the stream in an <img>
- * GET /stream   the stream itself
- */
-class MjpegServer(private val port: Int) {
-
-    private class Client {
-        /** Capacity 1 on purpose: a client that cannot keep up misses frames
-         *  instead of building a backlog of stale ones. */
-        val queue = ArrayBlockingQueue<ByteArray>(1)
-
-        @Volatile
-        var dead = false
+/** Bounded client count, one pending frame per viewer, no camera-thread network IO. */
+class MjpegServer(private val port: Int, private val code: String) {
+    private data class Frame(val jpeg: ByteArray, val rotation: Int)
+    private class Client(val socket: Socket) {
+        val queue = ArrayBlockingQueue<Frame>(1)
+        @Volatile var writingSince = 0L
     }
-
     private val clients = CopyOnWriteArrayList<Client>()
-
-    @Volatile
-    private var running = false
-
-    /**
-     * Degrees clockwise still needed to stand the picture up. Frames leave the
-     * phone unrotated, so both consumers need to know: the browser applies it
-     * as CSS, the server applies it while decoding. Served in the stream
-     * response headers and inlined into the page.
-     */
-    @Volatile
-    var rotationDegrees: Int = 0
-        private set
-
-    private var serverSocket: ServerSocket? = null
-
-    val clientCount: Int get() = clients.size
-
+    private val sockets = ConcurrentHashMap.newKeySet<Socket>()
+    @Volatile private var running = false
+    @Volatile private var latest: Frame? = null
+    private var listener: ServerSocket? = null
+    private var discovery: DatagramSocket? = null
+    val clientCount get() = clients.size
+    @Volatile var frameCount = 0L; private set
     fun start() {
-        if (running) return
-        serverSocket = ServerSocket(port)
+        listener = ServerSocket().apply { reuseAddress = true; bind(java.net.InetSocketAddress(port)) }
         running = true
-        thread(name = "mjpeg-accept", isDaemon = true) { acceptLoop() }
+        thread(name = "phonecam-accept") {
+            while (running) {
+                val socket = try { listener?.accept() ?: break } catch (_: Exception) { break }
+                if (sockets.size >= 4) { socket.close(); continue }
+                sockets.add(socket)
+                thread(name = "phonecam-http") { serve(socket) }
+            }
+        }
+        thread(name = "phonecam-watchdog") {
+            while (running) {
+                val now = System.nanoTime()
+                clients.filter { it.writingSince != 0L && now - it.writingSince > 2_000_000_000L }
+                    .forEach { runCatching { it.socket.close() } }
+                Thread.sleep(500)
+            }
+        }
+        // Discovery is optional; a blocked UDP port must not prevent manual connection.
+        runCatching { DatagramSocket(5888).also { discovery = it } }.getOrNull()?.let { udp ->
+            thread(name = "phonecam-discovery") {
+                val buffer = ByteArray(128)
+                while (running) {
+                    try {
+                        val request = DatagramPacket(buffer, buffer.size); udp.receive(request)
+                        if (String(request.data, 0, request.length, Charsets.US_ASCII) == "PHONECAM_DISCOVER_V1") {
+                            val reply = "PHONECAM_V1:$port".toByteArray()
+                            udp.send(DatagramPacket(reply, reply.size, request.address, request.port))
+                        }
+                    } catch (_: Exception) { break }
+                }
+            }
+        }
     }
-
     fun stop() {
         running = false
-        // Closing the socket is what unblocks accept(); interrupting it is not
-        // enough on all platforms.
-        runCatching { serverSocket?.close() }
-        serverSocket = null
-        for (c in clients) c.dead = true
-        clients.clear()
+        runCatching { listener?.close() }; listener = null
+        discovery?.close(); discovery = null
+        sockets.forEach { runCatching { it.close() } }; sockets.clear(); clients.clear(); latest = null
     }
-
-    /** Hands a frame to every client. Called from the camera thread. */
-    fun submit(jpeg: ByteArray, rotationDegrees: Int) {
-        this.rotationDegrees = rotationDegrees
-        for (c in clients) {
-            c.queue.poll()
-            c.queue.offer(jpeg)
+    fun submit(jpeg: ByteArray, rotation: Int) {
+        val frame = Frame(jpeg, rotation); latest = frame; frameCount++
+        clients.forEach { it.queue.poll(); it.queue.offer(frame) }
+    }
+    private fun line(input: InputStream): String {
+        val bytes = ArrayList<Byte>()
+        while (bytes.size < 2048) {
+            val n = input.read(); check(n >= 0) { "Disconnected" }
+            if (n == 10) return bytes.toByteArray().toString(Charsets.US_ASCII).trimEnd('\r')
+            bytes.add(n.toByte())
         }
+        error("Request too long")
     }
-
-    private fun acceptLoop() {
-        while (running) {
-            val socket = try {
-                serverSocket?.accept() ?: break
-            } catch (e: IOException) {
-                break // closed under us, which is how stop() is meant to work
-            }
-            thread(name = "mjpeg-client", isDaemon = true) { serve(socket) }
-        }
-    }
-
     private fun serve(socket: Socket) {
         try {
-            socket.tcpNoDelay = true
-            // Browsers open speculative connections and then say nothing. A
-            // blocking readLine() with no timeout parks a thread on each one
-            // for as long as the socket lives.
-            socket.soTimeout = REQUEST_TIMEOUT_MS
-            val reader = socket.getInputStream().bufferedReader()
-
-            val requestLine = reader.readLine() ?: return
-            // Drain the headers. GET carries no body, so nothing is lost by
-            // stopping at the blank line even though the reader may have
-            // buffered past it.
-            while (true) {
-                val line = reader.readLine()
-                if (line.isNullOrEmpty()) break
+            socket.soTimeout = 3000; socket.tcpNoDelay = true; socket.sendBufferSize = 64 * 1024
+            val input = socket.getInputStream().buffered()
+            val request = line(input).split(' ')
+            check(request.size == 3 && request[0] == "GET")
+            var headers = 0
+            while (line(input).isNotEmpty()) check(++headers <= 32)
+            val path = request[1].substringBefore('?')
+            val query = request[1].substringAfter('?', "").split('&')
+            val out = BufferedOutputStream(socket.getOutputStream(), 64 * 1024)
+            if ("code=$code" !in query) { response(out, "403 Forbidden", "Connection code required. Use the address displayed on your phone."); return }
+            when (path) {
+                "/stream" -> stream(socket, out)
+                "/", "" -> response(out, "200 OK", page())
+                "/rotation" -> response(out, "200 OK", (latest?.rotation ?: 0).toString(), "text/plain")
+                else -> response(out, "404 Not Found", "Not found")
             }
-
-            val path = requestLine.split(' ').getOrNull(1) ?: "/"
-            val out = BufferedOutputStream(socket.getOutputStream())
-
-            if (path.startsWith("/stream")) {
-                stream(socket, out)
-            } else {
-                val body = page().toByteArray()
-                out.write(
-                    (
-                        "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: text/html; charset=utf-8\r\n" +
-                            "Content-Length: ${body.size}\r\n" +
-                            "Connection: close\r\n\r\n"
-                        ).toByteArray()
-                )
-                out.write(body)
-                out.flush()
-            }
-        } catch (e: IOException) {
-            // The client hung up. Nothing to do and nothing worth logging at
-            // this stage.
-        } finally {
-            runCatching { socket.close() }
-        }
+        } catch (_: Exception) {
+            // Closing the socket also interrupts a stalled writer during service shutdown.
+        } finally { sockets.remove(socket); runCatching { socket.close() } }
     }
-
+    private fun response(out: BufferedOutputStream, status: String, body: String, type: String = "text/html; charset=utf-8") {
+        val bytes = body.toByteArray()
+        out.write("HTTP/1.1 $status\r\nContent-Type: $type\r\nContent-Length: ${bytes.size}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".toByteArray())
+        out.write(bytes); out.flush()
+    }
     private fun stream(socket: Socket, out: BufferedOutputStream) {
-        // A stream is long-lived and write-only from here, so the request
-        // timeout has done its job.
-        runCatching { socket.soTimeout = 0 }
-
-        val client = Client()
-        clients.add(client)
+        val client = Client(socket); clients.add(client)
+        latest?.let { client.queue.offer(it) }
         try {
-            out.write(
-                (
-                    "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: multipart/x-mixed-replace; boundary=$BOUNDARY\r\n" +
-                        // Not a standard header, but this stream is not a
-                        // standard stream either: the frames are unrotated and
-                        // whoever decodes them has to know by how much.
-                        "X-PhoneCam-Rotation: $rotationDegrees\r\n" +
-                        "X-PhoneCam-Boundary: $BOUNDARY\r\n" +
-                        "Cache-Control: no-store, no-cache, must-revalidate\r\n" +
-                        "Pragma: no-cache\r\n" +
-                        "Connection: close\r\n\r\n"
-                    ).toByteArray()
-            )
-            out.flush()
-
-            while (running && !client.dead) {
-                // Poll rather than take, so a client that goes away is noticed
-                // even when the camera has stopped sending.
-                val frame = client.queue.poll(500, TimeUnit.MILLISECONDS) ?: continue
-                out.write(
-                    (
-                        "--$BOUNDARY\r\n" +
-                            "Content-Type: image/jpeg\r\n" +
-                            "Content-Length: ${frame.size}\r\n\r\n"
-                        ).toByteArray()
-                )
-                out.write(frame)
-                out.write(CRLF)
-                out.flush()
+            out.write(("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=phonecamframe\r\n" +
+                "X-PhoneCam-Boundary: phonecamframe\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray()); out.flush()
+            while (running && !socket.isClosed) {
+                val frame = client.queue.poll(1, TimeUnit.SECONDS) ?: continue
+                client.writingSince = System.nanoTime()
+                out.write(("--phonecamframe\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.jpeg.size}\r\n" +
+                    "X-PhoneCam-Rotation: ${frame.rotation}\r\n\r\n").toByteArray())
+                out.write(frame.jpeg); out.write(byteArrayOf(13, 10)); out.flush()
+                client.writingSince = 0
             }
-        } catch (e: IOException) {
-            // Client gone.
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-        } finally {
-            clients.remove(client)
-            runCatching { socket.close() }
-        }
+        } finally { clients.remove(client) }
     }
-
-    private fun page(): String {
-        // The frames arrive unrotated, so the page stands them up itself —
-        // the same correction the PC server will make while decoding, which is
-        // why both are driven by the one number the phone reports.
-        val rotation = rotationDegrees
-        val sideways = rotation == 90 || rotation == 270
-        val box = if (sideways) {
-            "max-width: 78vh; max-height: 94vw;"
-        } else {
-            "max-width: 94vw; max-height: 78vh;"
-        }
-
-        return """
-        <!doctype html>
-        <html lang="en">
-        <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>PhoneCam</title>
-          <style>
-            html, body { margin: 0; height: 100%; background: #14181e; color: #e8e8e8;
-                         font: 15px/1.5 system-ui, sans-serif; }
-            main { height: 100%; display: flex; flex-direction: column;
-                   align-items: center; justify-content: center; gap: 14px; }
-            img { background: #000; border: 1px solid #2c333d; border-radius: 6px;
-                  transform: rotate(${rotation}deg); $box }
-            p { margin: 0; color: #8d98a6; }
-          </style>
-        </head>
-        <body>
-          <main>
-            <img src="/stream" alt="PhoneCam stream">
-            <p>PhoneCam &mdash; served by the phone itself, rotated ${rotation}&deg; for display.</p>
-          </main>
-        </body>
-        </html>
-        """.trimIndent()
-    }
-
-    private companion object {
-        const val BOUNDARY = "phonecamframe"
-        const val REQUEST_TIMEOUT_MS = 5000
-        val CRLF = "\r\n".toByteArray()
-    }
+    private fun page() = """
+        <!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+        <title>PhoneCam</title><style>body{background:#101820;color:#eef5fa;font:16px system-ui;text-align:center;overflow:hidden}img{max-width:85vw;max-height:72vh;object-fit:contain;margin:5vh auto}footer{position:fixed;bottom:12px;width:100%}</style>
+        <h2>PhoneCam · просмотр</h2><img id="camera" src="/stream?code=$code"><footer>Для видеозвонков выбери камеру PhoneCam на ПК.</footer>
+        <script>setInterval(async()=>{try{let r=await(await fetch('/rotation?code=$code')).text();let n=Number(r);camera.style.transform='rotate('+n+'deg)';camera.style.maxWidth=(n%180?'65vh':'85vw');camera.style.maxHeight=(n%180?'85vw':'72vh')}catch(e){}},1000)</script></html>
+    """.trimIndent()
 }

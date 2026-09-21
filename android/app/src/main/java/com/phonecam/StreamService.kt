@@ -28,6 +28,9 @@ class StreamService : LifecycleService() {
 
     companion object {
         const val PORT = 8080
+        @Volatile var starting = false; private set
+        @Volatile var code = ""; private set
+        @Volatile var frames = 0L; private set
 
         private const val CHANNEL_ID = "phonecam.stream"
         private const val NOTIFICATION_ID = 1
@@ -50,12 +53,15 @@ class StreamService : LifecycleService() {
             private set
     }
 
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
     private var server: MjpegServer? = null
     private var camera: CameraSource? = null
     private val handler = Handler(Looper.getMainLooper())
     private val poll = object : Runnable {
         override fun run() {
             viewers = server?.clientCount ?: 0
+            frames = server?.frameCount ?: 0
+            if (wakeLock?.isHeld == false) wakeLock?.acquire(10 * 60 * 1000L)
             handler.postDelayed(this, 1000)
         }
     }
@@ -75,10 +81,11 @@ class StreamService : LifecycleService() {
 
         startForegroundCompat()
 
-        if (server == null) startStreaming()
+        if (server == null) startStreaming(intent)
 
         // Unconditional: the camera reports readiness asynchronously, so
         // `running` is still false here on a healthy start.
+        handler.removeCallbacks(poll)
         handler.post(poll)
         return START_NOT_STICKY
     }
@@ -89,7 +96,9 @@ class StreamService : LifecycleService() {
         // service the way a normal one would.
         stopForeground(STOP_FOREGROUND_REMOVE)
         running = false
+        starting = false
         viewers = 0
+        wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null
         camera?.stop()
         camera = null
         server?.stop()
@@ -102,10 +111,11 @@ class StreamService : LifecycleService() {
         return null
     }
 
-    private fun startStreaming() {
+    private fun startStreaming(intent: Intent?) {
         lastError = null
-
-        val s = MjpegServer(PORT)
+        starting = true
+        code = (100000 + java.security.SecureRandom().nextInt(900000)).toString()
+        val s = MjpegServer(PORT, code)
         try {
             s.start()
         } catch (e: Exception) {
@@ -117,11 +127,18 @@ class StreamService : LifecycleService() {
             return
         }
         server = s
+        val power = getSystemService(android.os.PowerManager::class.java)
+        wakeLock = power.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "PhoneCam:stream").apply { setReferenceCounted(false); acquire(10 * 60 * 1000L) }
 
-        val c = CameraSource(this, this) { frame, rotation -> s.submit(frame, rotation) }
+        val c = CameraSource(this, this,
+            intent?.getIntExtra("lens", 0) ?: 0,
+            intent?.getIntExtra("width", 1280) ?: 1280,
+            intent?.getIntExtra("fps", 30) ?: 30,
+            intent?.getIntExtra("quality", 75) ?: 75,
+        ) { frame, rotation -> s.submit(frame, rotation) }
         camera = c
         c.start(
-            onReady = { running = true },
+            onReady = { starting = false; running = true },
             onError = { message ->
                 lastError = message
                 stopSelf()
@@ -131,7 +148,7 @@ class StreamService : LifecycleService() {
 
     private fun startForegroundCompat() {
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
         } else {
             startForeground(NOTIFICATION_ID, notification)

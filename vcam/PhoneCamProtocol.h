@@ -68,7 +68,7 @@ typedef struct PhoneCamHeader {
     uint32_t format;     /* PhoneCamFormat */
     volatile uint32_t frameIndex; /* seqlock counter; 0 = nothing drawn yet */
     uint32_t activeBuffer;        /* 0..PHONECAM_BUFFERS-1, the complete one */
-    uint32_t reserved[8];         /* pad to 64 so pixels start aligned */
+    uint32_t reserved[8];         /* [0] = GetTickCount heartbeat at publish; rest reserved */
 } PhoneCamHeader;
 #pragma pack(pop)
 
