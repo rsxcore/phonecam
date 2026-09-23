@@ -1,6 +1,10 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-<path android:fillColor="#5BDCB4" android:pathData="M40,22 L68,22 Q75,22 75,29 L75,80 Q75,87 68,87 L40,87 Q33,87 33,80 L33,29 Q33,22 40,22Z"/>
-<path android:fillColor="#101820" android:pathData="M39,30 L69,30 L69,75 L39,75Z M49,79 L59,79 L59,82 L49,82Z"/>
-<path android:fillColor="#5BDCB4" android:pathData="M54,42 A11,11 0,1 1,54 64 A11,11 0,1 1,54 42"/>
-<path android:fillColor="#101820" android:pathData="M54,48 A5,5 0,1 1,54 58 A5,5 0,1 1,54 48"/>
+<!-- Lens ring, yellow iris, red "live" dot: same mark as the desktop icon (assets/icon.svg). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FF050506" android:pathData="M54,56m-19,0a19,19 0,1 1,38 0a19,19 0,1 1,-38 0"/>
+    <path android:fillColor="#00000000" android:strokeColor="#FFF5F5F7" android:strokeWidth="4.2"
+        android:pathData="M54,56m-19,0a19,19 0,1 1,38 0a19,19 0,1 1,-38 0"/>
+    <path android:fillColor="#FFFFD60A" android:pathData="M54,56m-8.1,0a8.1,8.1 0,1 1,16.2 0a8.1,8.1 0,1 1,-16.2 0"/>
+    <path android:fillColor="#D9FFFFFF" android:pathData="M51,52.8m-2.2,0a2.2,2.2 0,1 1,4.4 0a2.2,2.2 0,1 1,-4.4 0"/>
+    <path android:fillColor="#FFFF3B30" android:pathData="M74,34m-4.2,0a4.2,4.2 0,1 1,8.4 0a4.2,4.2 0,1 1,-8.4 0"/>
 </vector>
