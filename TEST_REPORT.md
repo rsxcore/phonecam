@@ -1,45 +1,57 @@
-# Отчёт о проверках — PhoneCam 1.1
+# 🧪 Test Report — PhoneCam 1.1
 
-Дата: 21 сентября 2026. Среда: Windows 11 x64 на этой машине. Все проверки ниже выполнены реально; результаты физического телефона не моделируются как подтверждённые.
+[← Back to README](README.md)
 
-## Результаты
+**Date:** September 21, 2026  **Environment:** Windows 11 x64 (build machine)
 
-| Проверка | Результат |
-|---|---|
-| Release Rust, статическая проверка Clippy `-D warnings` | Успех |
-| Rust unit-тесты | 6 / 6 |
-| C++ виртуальная камера и Win32 EXE | Успешная release-сборка, статический CRT |
-| COM lifetime / format native-тест | 1000 циклов без ошибок |
-| Android release с R8 и resource shrinking | Успех |
-| Android JVM-тесты | 6 / 6, в том числе реальный HTTP/UDP и повторный запуск порта |
-| Android lint release | 0 ошибок; оставшиеся предупреждения о доступных новых версиях и стилевых предпочтениях |
-| APK | Подпись v2 проверена apksigner; пакет com.phonecam, версия 1.1 (2), minSdk 24, targetSdk 36 |
-| Регистрация виртуального устройства | PhoneCam перечисляется ffmpeg DirectShow, регистрация HKCU |
-| Движущийся тестовый сигнал и окно | Проверены запуск из кнопки и живой предпросмотр |
-| Сетевой JPEG → DirectShow | 60 кадров за 2 секунды, правильные цвета |
-| Поворот | 0°, 90°, 180°, 270°: контроль углов изображения пройден |
-| Пропорции | Вертикальный letterbox и выход 640×480 проверены |
-| Второй писатель | Отклонён, первый поток не повреждён |
-| Остановка приёмника | Устаревший кадр заменяется заливкой «нет сигнала» |
-| Перезапуск с удерживаемой общей памятью | Успех |
-| Зависание / разрыв / некорректная длина JPEG | Автовосстановление, неверные кадры не выдаются |
-| Непрерывный graph, 90 секунд | 2700 кадров, обнаруженных разрывов 0 |
-| Перезапуск приёмника внутри того же graph | Успех, захват не пересоздавался |
-| Сетевой обрыв внутри того же graph | Успех, захват не пересоздавался |
+Every check below was actually run. Physical-phone results are **not** presented as confirmed.
 
-В 90-секундном тесте источник чередовал 16 одноцветных JPEG 1280×720. Проверка сравнивала цвета по всему кадру после DirectShow-захвата; смесь частей разных кадров выявлялась как разрыв. Это целевой тест синхронизации, а не доказательство отсутствия любых возможных видеодефектов.
+## Results
 
-Последний показанный приёмником замер в длительном тесте: **30,1 входящих fps; 3,3 мс декодирование и подготовка кадра**. Это синтетический JPEG на localhost и конкретном ПК. Время камеры, JPEG-кодирования на телефоне, Wi-Fi и рендера приложения звонков в замер не входит. Нельзя называть эти 3,3 мс полной задержкой.
+| Check | Result |
+|:--|:--|
+| Rust release build, Clippy `-D warnings` | ✅ Pass |
+| Rust unit tests | ✅ 6 / 6 |
+| C++ virtual camera and Win32 EXE | ✅ Release build, static CRT |
+| COM lifetime / format native test | ✅ 1000 cycles, no errors |
+| Android release with R8 and resource shrinking | ✅ Pass |
+| Android JVM tests | ✅ 6 / 6, including real HTTP/UDP and port reuse on restart |
+| Android lint (release) | ✅ 0 errors; remaining warnings are about newer versions and style preferences |
+| APK | ✅ v2 signature verified by `apksigner`; package `com.phonecam`, version 1.1 (2), minSdk 24, targetSdk 36 |
+| Virtual device registration | ✅ PhoneCam enumerated by ffmpeg DirectShow, HKCU registration |
+| Moving test signal and window | ✅ Start from the button and live preview verified |
+| Network JPEG → DirectShow | ✅ 60 frames in 2 seconds, correct colors |
+| Rotation | ✅ 0°, 90°, 180°, 270° — image corner checks pass |
+| Aspect ratio | ✅ Portrait letterbox and 640×480 output verified |
+| Second writer | ✅ Rejected, first stream unaffected |
+| Receiver stop | ✅ Stale frame replaced with a "no signal" fill |
+| Restart while shared memory is held | ✅ Pass |
+| Hang / disconnect / invalid JPEG length | ✅ Auto-recovery, bad frames never output |
+| Continuous graph, 90 seconds | ✅ 2700 frames, 0 tears detected |
+| Receiver restart within the same graph | ✅ Pass, capture not recreated |
+| Network drop within the same graph | ✅ Pass, capture not recreated |
 
-Полная сборка и базовые проверки воспроизводятся `build.ps1 -Test`. Интеграционные тесты находятся в `tests/`; JSON-результаты сохранены в комплекте документации. Последнее изменение Win32 после сетевых проверок затрагивало восстановление окна из трея, без изменений приёмника и DLL.
+### About the soak test
 
-## Не проверялось
+In the 90-second test the source alternated between 16 solid-color 1280×720 JPEGs. The check compared colors across the whole frame after DirectShow capture; a mix of parts from different frames would be detected as a tear. This is a targeted synchronization test, not proof that no video defect of any kind can occur.
 
-- Физическая камера Android: adb не обнаружил подключённых устройств.
-- Работа на конкретном телефоне с выключенным экраном, OEM-ограничения, температура и расход батареи.
-- Реальная end-to-end задержка и устойчивость в домашнем Wi-Fi пользователя.
-- Реальный USB-проброс с телефоном.
-- Каждый конкретный клиент звонков, Windows Camera / Media Foundation-only приложения.
-- Аппаратный H.264, микрофон и x86: не входят в реализацию.
+### Performance
 
-Во время дальнейшей UI-проверки появился системный запрос брандмауэра от Java, используемой локальными JVM-тестами. Настройки безопасности не изменялись. Поэтому финальный сценарий поиска/ввода кода через мышь не заявляется как полностью проверенный; его сетевые компоненты проверены отдельно автоматическими тестами. Ранее кнопка теста и предпросмотр окна проверены визуально.
+Last receiver reading during the long test: **30.1 incoming fps; 3.3 ms decode + frame preparation.**
+
+> [!WARNING]
+> This is a synthetic JPEG on localhost on one specific PC. Camera time, JPEG encoding on the phone, Wi-Fi and the calling app's rendering are not included. These 3.3 ms must not be called end-to-end latency.
+
+The full build and core checks are reproducible with `build.ps1 -Test`. Integration tests live in `tests/`. The last Win32 change after the network tests touched only restoring the window from the tray, with no changes to the receiver or the DLL.
+
+## ❌ Not tested
+
+- Physical Android camera — `adb` found no connected devices
+- Behavior on a specific phone with the screen off, OEM restrictions, temperature and battery drain
+- Real end-to-end latency and stability on the user's home Wi-Fi
+- Real USB forwarding with a phone
+- Each specific calling app, Windows Camera / Media Foundation-only apps
+- Hardware H.264, microphone and x86 — not part of this implementation
+
+> [!NOTE]
+> During later UI testing, a Windows Firewall prompt appeared for the Java runtime used by the local JVM tests; security settings were not changed. Therefore the final mouse-driven discover / enter-code flow is not claimed as fully verified — its network components were tested separately by automated tests. The test button and window preview were verified visually earlier.

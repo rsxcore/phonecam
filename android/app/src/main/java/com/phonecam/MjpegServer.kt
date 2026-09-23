@@ -125,9 +125,9 @@ class MjpegServer(private val port: Int, private val code: String) {
         } finally { clients.remove(client) }
     }
     private fun page() = """
-        <!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+        <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
         <title>PhoneCam</title><style>body{background:#101820;color:#eef5fa;font:16px system-ui;text-align:center;overflow:hidden}img{max-width:85vw;max-height:72vh;object-fit:contain;margin:5vh auto}footer{position:fixed;bottom:12px;width:100%}</style>
-        <h2>PhoneCam · просмотр</h2><img id="camera" src="/stream?code=$code"><footer>Для видеозвонков выбери камеру PhoneCam на ПК.</footer>
+        <h2>PhoneCam · viewer</h2><img id="camera" src="/stream?code=$code"><footer>For video calls, select the PhoneCam camera on your PC.</footer>
         <script>setInterval(async()=>{try{let r=await(await fetch('/rotation?code=$code')).text();let n=Number(r);camera.style.transform='rotate('+n+'deg)';camera.style.maxWidth=(n%180?'65vh':'85vw');camera.style.maxHeight=(n%180?'85vw':'72vh')}catch(e){}},1000)</script></html>
     """.trimIndent()
 }

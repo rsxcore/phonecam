@@ -1,25 +1,28 @@
-# Roadmap
+# 🗺 Roadmap
 
-## Реализовано в 1.1
+[← Back to README](README.md)
 
-- Приём MJPEG и выдача реальной картинки через DirectShow.
-- Исправление YUV, ориентации, жизненного цикла камеры и сервиса.
-- Переподключение, bounded queues, heartbeat, защита от второго писателя.
-- Исправление COM lifetime, владения AM_MEDIA_TYPE и регистрации HKCU.
-- Один Win32 EXE: встроенные DLL/приёмник, предпросмотр, код, поиск, трей.
-- Оптимизированный APK с постоянной локальной release-подписью.
-- Unit/native/integration проверки и документация на русском.
+## ✅ Shipped in 1.1
 
-## Не подтверждено без физического телефона
+- [x] MJPEG receiving and real video output through DirectShow
+- [x] Fixed YUV handling, orientation, and camera / service lifecycle
+- [x] Reconnect, bounded queues, heartbeat, second-writer protection
+- [x] Fixed COM lifetime, `AM_MEDIA_TYPE` ownership and HKCU registration
+- [x] Single Win32 EXE: embedded DLL / receiver, preview, code, discovery, tray
+- [x] Optimized APK with a permanent local release signature
+- [x] Unit / native / integration tests and documentation
 
-- Получение CameraX-кадров на конкретной модели, фон/погашенный экран.
-- Реальная сетевая задержка, Wi-Fi/USB, нагрев и расход батареи.
-- Совместимость с каждым конкретным приложением звонков.
+## ❓ Unconfirmed without a physical phone
 
-## Возможные дальнейшие улучшения после измерений
+- [ ] CameraX frame capture on a specific phone model, background / screen-off behavior
+- [ ] Real network latency over Wi-Fi / USB, heat and battery drain
+- [ ] Compatibility with each specific calling app
 
-- Аппаратный H.264: MediaCodec → Media Foundation.
-- Media Foundation virtual camera, если требуется конкретным клиентом.
-- x86-фильтр, микрофон, QR-подключение и автозапуск — при необходимости.
+## 🔭 Possible improvements after measurements
 
-Эта версия не заявляет реализацию перечисленных будущих возможностей.
+- [ ] Hardware H.264: MediaCodec → Media Foundation
+- [ ] Media Foundation virtual camera, if a specific client requires it
+- [ ] x86 filter, microphone, QR pairing and autostart — if needed
+
+> [!NOTE]
+> This version does not claim to implement any of the future items above.

@@ -1,32 +1,87 @@
-# Разработка PhoneCam 1.1
+# 🧑‍💻 PhoneCam 1.1 — Development Guide
 
-## Состав
+[← Back to README](README.md)
 
-- `android/`: Kotlin + CameraX. `CameraSource` получает YUV_420_888; `YuvPlanes` читает все три плоскости с учётом позиции буфера, rowStride и pixelStride; `YuvImage` кодирует JPEG. Рабочие NV21 и JPEG-буферы переиспользуются.
-- `MjpegServer`: HTTP TCP 8080, UDP discovery 5888, максимум четыре сокета, очередь из одного кадра на клиента, watchdog закрывает заблокированную запись после двух секунд. Код меняется при каждом запуске сервиса. Заголовок поворота находится в каждой части MJPEG.
-- `server/`: Rust, стандартные сокеты и zune-jpeg. Сетевой поток постоянно читает в слот последнего кадра; декодер не накапливает очередь. Поворот/letterbox в BGRA 1280×720; для совпадающего размера без поворота быстрый memcpy. Лимиты заголовков, JPEG и размеров изображения; таймауты и переподключение.
-- `vcam/`: C++ DirectShow RGB32, 64 бит, 1280×720 / 1920×1080 / 640×480, 30 fps. Двойной буфер, строгая проверка seqlock, heartbeat 2,5 с. COM-объекты удерживают DLL; pin удерживает filter, обратная ссылка на graph слабая. Освобождение памяти форматов соответствует владению COM.
-- `desktop/`: C++ Win32. EXE содержит приёмник и DLL как ресурсы; распаковка в каталог по хешу, регистрация HKCU, окно, поиск телефона, код, тест, предпросмотр, трей. Job Object завершает дочерний приёмник при выходе даже при аварии окна. Системных рантаймов кроме Windows не требуется.
+## Architecture
 
-## Контракт
+```mermaid
+flowchart LR
+    subgraph Phone["📱 Android app"]
+        CAM[CameraX<br/>YUV_420_888] --> JPEG[JPEG encoder] --> SRV[MjpegServer<br/>HTTP :8080 · UDP :5888]
+    end
+    subgraph PC["💻 Windows"]
+        EXE[PhoneCam.exe<br/>Win32 UI] -. spawns .-> RX[phonecam-server<br/>Rust receiver]
+        RX -->|shared memory<br/>BGRA 1280×720| VCAM[PhoneCam DirectShow<br/>filter DLL]
+    end
+    SRV -->|MJPEG over HTTP| RX
+    VCAM --> APPS[OBS · Discord · browsers]
+```
 
-`Local\PhoneCam_Frame_v1`, 16 588 864 байта. Заголовок 64 байта, два буфера по 1920×1080×4. `frameIndex`: нечётный во время записи, чётный ненулевой после публикации. `activeBuffer`: 0 или 1. `reserved[0]`: младшие 32 бита GetTickCount при публикации. Читатель проверяет равенство счётчика до/после копии; устаревший кадр не выдаёт. Размер публикуемого изображения фиксирован 1280×720. Старые версии производителя без heartbeat с новым фильтром несовместимы по свежести.
+| Component | Stack | Responsibilities |
+|:--|:--|:--|
+| `android/` | Kotlin, CameraX | `CameraSource` receives YUV_420_888. `YuvPlanes` reads all three planes honoring buffer position, `rowStride` and `pixelStride`; `YuvImage` encodes JPEG. NV21 and JPEG work buffers are reused. |
+| `MjpegServer` | Kotlin, sockets | HTTP on TCP 8080, UDP discovery on 5888, at most four sockets, a one-frame queue per client; a watchdog closes a blocked write after two seconds. The code changes on every service start. Every MJPEG part carries a rotation header. |
+| `server/` | Rust, `std` sockets, zune-jpeg | The network thread continuously writes into a latest-frame slot; the decoder never builds a backlog. Rotation / letterbox into BGRA 1280×720, with a fast `memcpy` path for same-size unrotated frames. Limits on headers, JPEG size and image dimensions; timeouts and reconnect. |
+| `vcam/` | C++, DirectShow | RGB32, 64-bit, 1280×720 / 1920×1080 / 640×480, 30 fps. Double buffer, strict seqlock validation, 2.5 s heartbeat. COM objects hold the DLL; the pin holds the filter, the back-reference to the graph is weak. Format memory is freed according to COM ownership rules. |
+| `desktop/` | C++, Win32 | The EXE embeds the receiver and DLL as resources, unpacks them into a hash-named folder, registers under HKCU, and provides the window, phone discovery, code entry, test signal, preview and tray. A Job Object kills the child receiver on exit even if the window crashes. No runtimes beyond Windows itself. |
 
-Один писатель обеспечивается отдельным named mutex `Local\PhoneCam_Writer_v1`. Существующий memory mapping сам по себе **не** означает наличие писателя: его могут удерживать читатели после завершения приёмника.
+## Contracts
 
-HTTP: `/stream?code=123456`, multipart boundary `phonecamframe`, `Content-Length` каждого JPEG, `X-PhoneCam-Rotation: 0|90|180|270` в каждой части. `/` — просмотр, `/rotation` — ориентация для браузера; все требуют код. Discovery: `PHONECAM_DISCOVER_V1` → `PHONECAM_V1:8080`, без кода и персональных данных. Код не даёт криптографической защиты.
+### Shared memory
 
-## Сборка
+| Field | Value |
+|:--|:--|
+| Name | `Local\PhoneCam_Frame_v1` |
+| Size | 16 588 864 bytes — 64-byte header + two buffers of 1920×1080×4 |
+| `frameIndex` | Odd while writing; even and non-zero once published |
+| `activeBuffer` | `0` or `1` |
+| `reserved[0]` | Low 32 bits of `GetTickCount` at publish time |
+| Published image size | Fixed at 1280×720 |
 
-Окружение этой сборки: Windows x64, Visual Studio Build Tools с C++, Rust MSVC, JDK 25, Gradle wrapper 9.1.0, Android SDK platform 36 / build-tools 36.0.0. JDK 17 для Kotlin загружает Gradle toolchain. Версии закреплены; автоматическое обновление всех зависимостей намеренно не делалось.
+The reader checks that the counter is equal before and after the copy and never returns a stale frame. Older producers without a heartbeat are incompatible with the new filter's freshness check.
 
-`pwsh -File .\build.ps1 -Test` собирает EXE и подписанный APK и запускает Rust/JVM/native проверки. Результат: `dist\PhoneCam-1.1.exe`, `dist\PhoneCam.apk`.
+A single writer is enforced by a separate named mutex, `Local\PhoneCam_Writer_v1`. An existing memory mapping does **not** by itself mean that a writer is present: readers may keep it alive after the receiver exits.
 
-`android\local.properties` содержит путь SDK этой машины. Для другой машины укажи свой `sdk.dir`. При отсутствии ключа один раз запусти `New-ReleaseKey.ps1`. Не запускай его для замены существующего ключа.
+### HTTP & discovery
 
-**Ключ подписи:** `android\phonecam-release.jks` и пароль в `android\signing.properties`. Они исключены из Git и из публичных архивов. Сохрани оба файла отдельно в надёжном месте: без них нельзя подписать совместимое обновление уже установленного APK. При потере ключа потребуется удаление приложения перед установкой новой подписи.
+| Endpoint | Description |
+|:--|:--|
+| `GET /stream?code=123456` | `multipart/x-mixed-replace`, boundary `phonecamframe`; each part has `Content-Length` and `X-PhoneCam-Rotation: 0\|90\|180\|270` |
+| `GET /` | Browser viewer |
+| `GET /rotation` | Current orientation for the browser viewer |
+| UDP `:5888` | `PHONECAM_DISCOVER_V1` → `PHONECAM_V1:8080` — no code, no personal data |
 
-CLI приёмника:
+All HTTP endpoints require the code. The code provides **no** cryptographic protection.
+
+## Building
+
+### Toolchain used for this build
+
+- Windows x64
+- Visual Studio Build Tools with C++
+- Rust (MSVC)
+- JDK 25, Gradle wrapper 9.1.0 (JDK 17 for Kotlin is provisioned by the Gradle toolchain)
+- Android SDK platform 36 / build-tools 36.0.0
+
+Versions are pinned; bulk dependency upgrades were intentionally not done.
+
+### Build everything
+
+```powershell
+pwsh -File .\build.ps1 -Test
+```
+
+Builds the EXE and the signed APK and runs the Rust / JVM / native checks. Output: `dist\PhoneCam-1.1.exe` and `dist\PhoneCam.apk`.
+
+### Machine-specific setup
+
+- `android\local.properties` holds this machine's SDK path. On another machine, set your own `sdk.dir`.
+- If there is no signing key yet, run `New-ReleaseKey.ps1` **once**. Never run it to replace an existing key.
+
+> [!IMPORTANT]
+> **Signing key:** `android\phonecam-release.jks` with its password in `android\signing.properties`. Both are excluded from Git and public archives. Back them up somewhere safe — without them you cannot sign a compatible update for already-installed APKs. If the key is lost, users must uninstall the app before installing a build with a new signature.
+
+### Receiver & installer CLI
 
 ```powershell
 .\server\target\release\phonecam-server.exe --test
@@ -35,19 +90,26 @@ CLI приёмника:
 .\dist\PhoneCam-1.1.exe --uninstall
 ```
 
-Не запускай одновременно несколько приёмников в одной пользовательской сессии. Windows-клиент перезапускает свой приёмник сам.
+> [!WARNING]
+> Do not run several receivers in the same user session. The Windows client restarts its own receiver.
 
-## Проверки
+## Testing
 
-- `cargo test --manifest-path server\Cargo.toml`: 6 тестов URL, multipart, лимитов, поворотов, letterbox и повреждённого JPEG.
-- `cargo clippy --manifest-path server\Cargo.toml --all-targets -- -D warnings`.
-- `tests\native.bat`: 1000 циклов проверки ссылок COM, удержания pin/filter/enum, LockServer, DllCanUnloadNow, GetStreamCaps с неинициализированным out-указателем, проверки размеров и формата.
-- `android\gradlew.bat -p android testDebugUnitTest lintRelease`: 6 тестов YUV и настоящих HTTP/UDP-сокетов на JVM. Эти тесты не эмулируют физический CameraX.
-- `python tests\integration.py`: требует Python + Pillow + ffmpeg в PATH, release Rust и зарегистрированную актуальную DLL. Тестирует реальные DirectShow-кадры, ориентации, масштабирование, restart и fault recovery. Никакая физическая камера не включается.
-- `python tests\soak.py`: 90 секунд одного DirectShow graph, перезапуск приёмника и сетевой обрыв без пересоздания захвата; проверяет целостность кадров.
+| Command | What it covers |
+|:--|:--|
+| `cargo test --manifest-path server\Cargo.toml` | 6 tests: URL parsing, multipart, limits, rotation, letterbox, corrupted JPEG |
+| `cargo clippy --manifest-path server\Cargo.toml --all-targets -- -D warnings` | Static analysis |
+| `tests\native.bat` | 1000 cycles of COM reference checks: pin/filter/enum holding, `LockServer`, `DllCanUnloadNow`, `GetStreamCaps` with an uninitialized out-pointer, size and format checks |
+| `android\gradlew.bat -p android testDebugUnitTest lintRelease` | 6 JVM tests for YUV and real HTTP/UDP sockets (does not emulate physical CameraX) |
+| `python tests\integration.py` | Real DirectShow frames, orientations, scaling, restart and fault recovery. Requires Python + Pillow + ffmpeg on `PATH`, the release Rust build and the current DLL registered. No physical camera is used. |
+| `python tests\soak.py` | 90 s in one DirectShow graph with a receiver restart and a network drop, without recreating the capture; checks frame integrity |
 
-Тестовые изображения, логи и промежуточные скрипты находятся в `work/`, в Git не входят. Python нужен только разработчику для интеграционных проверок, в продуктах не используется.
+Test images, logs and scratch scripts live in `work/` and are not tracked by Git. Python is only needed for developer integration tests and is not used by the product.
 
-## Следующий осмысленный шаг
+## Next meaningful step
 
-Сначала измерить на настоящем телефоне fps, задержку, температуру и расход батареи. Если JPEG становится ограничением — отдельный транспорт аппаратного H.264 через MediaCodec и Media Foundation с ограниченной очередью и явным сбросом декодера при потере соединения. Не подменять измерения заявлениями о «нулевой задержке». Для более широкой совместимости рассмотреть Media Foundation virtual camera и 32-битный DirectShow-фильтр как отдельные проверяемые задачи.
+1. **Measure on a real phone first:** fps, latency, temperature and battery drain.
+2. If JPEG becomes the bottleneck — a separate hardware H.264 transport via MediaCodec → Media Foundation, with a bounded queue and an explicit decoder reset on connection loss.
+3. For wider compatibility, consider a Media Foundation virtual camera and a 32-bit DirectShow filter as separate, testable tasks.
+
+Don't substitute measurements with "zero latency" claims.

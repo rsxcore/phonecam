@@ -50,34 +50,34 @@ class MainActivity : Activity() {
             root.addView(this, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) })
         }
         text("PhoneCam", 34f)
-        text("Твой телефон — камера для ПК", 16f, Color.rgb(160, 186, 200))
-        text("1  Подключи телефон и ПК к одной Wi-Fi сети.\n2  Выбери камеру и нажми «Включить».\n3  Открой PhoneCam.exe и введи код.", 15f)
-        text("Камера", 14f, Color.LTGRAY)
+        text("Your phone as a PC webcam", 16f, Color.rgb(160, 186, 200))
+        text("1  Connect the phone and PC to the same Wi-Fi network.\n2  Pick a camera and tap “Start camera”.\n3  Open PhoneCam.exe and enter the code.", 15f)
+        text("Camera", 14f, Color.LTGRAY)
         fun spinner(items: Array<String>): Spinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
             root.addView(this, LinearLayout.LayoutParams(-1, dp(52)).apply { bottomMargin = dp(12) })
         }
-        lens = spinner(arrayOf("Фронтальная", "Основная"))
-        text("Качество и нагрузка", 14f, Color.LTGRAY)
-        preset = spinner(arrayOf("Баланс · 720p / до 30 fps", "Экономия · 480p / до 15 fps", "Детали · 720p / до 30 fps, JPEG 90"))
+        lens = spinner(arrayOf("Front", "Back"))
+        text("Quality and load", 14f, Color.LTGRAY)
+        preset = spinner(arrayOf("Balanced · 720p / up to 30 fps", "Saver · 480p / up to 15 fps", "Detail · 720p / up to 30 fps, JPEG 90"))
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         lens.setSelection(prefs.getInt("lens", 0).coerceIn(0, 1))
         preset.setSelection(prefs.getInt("preset", 0).coerceIn(0, 2))
-        toggle = Button(this).apply { text = "Включить камеру"; root.addView(this, LinearLayout.LayoutParams(-1, dp(56))) }
-        status = text("Камера выключена", 16f, Color.rgb(91, 220, 180))
-        pairing = text("Код появится после включения", 24f)
+        toggle = Button(this).apply { text = "Start camera"; root.addView(this, LinearLayout.LayoutParams(-1, dp(56))) }
+        status = text("Camera is off", 16f, Color.rgb(91, 220, 180))
+        pairing = text("The code appears after you start", 24f)
         address = text("", 14f, Color.LTGRAY).apply { setTextIsSelectable(true) }
         Button(this).apply {
-            text = "Скопировать адрес для браузера"
+            text = "Copy browser link"
             root.addView(this, LinearLayout.LayoutParams(-1, dp(52)))
             setOnClickListener {
                 if (currentUrl.isNotEmpty()) {
                     getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("PhoneCam", currentUrl))
-                    Toast.makeText(this@MainActivity, "Адрес скопирован", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Link copied", Toast.LENGTH_SHORT).show()
                 }
             }
         }
-        text("Поверни телефон горизонтально для широкого кадра. Можно погасить экран: передача продолжается. Для остановки используй кнопку здесь или в уведомлении.\n\nВидео передаётся по локальной сети без шифрования. Используй доверенный Wi-Fi. Микрофон не передаётся.", 13f, Color.rgb(160, 186, 200))
+        text("Turn the phone sideways for a wide frame. You can turn the screen off: streaming continues. To stop, use the button here or in the notification.\n\nVideo is sent over the local network without encryption. Use a trusted Wi-Fi network. The microphone is not streamed.", 13f, Color.rgb(160, 186, 200))
         toggle.setOnClickListener {
             if (StreamService.running || StreamService.starting) {
                 stopService(Intent(this, StreamService::class.java)); pending = false
@@ -114,24 +114,24 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, results)
         if (requestCode == 1) {
             if (results.firstOrNull() == PackageManager.PERMISSION_GRANTED) begin()
-            else Toast.makeText(this, "Разреши доступ к камере для передачи видео", Toast.LENGTH_LONG).show()
+            else Toast.makeText(this, "Allow camera access to stream video", Toast.LENGTH_LONG).show()
         } else if (requestCode == 2) launch()
     }
     private fun refresh() {
         if (ticks++ % 5 == 0) cachedIp = localIpv4()
         val active = StreamService.running || StreamService.starting || pending
         lens.isEnabled = !active; preset.isEnabled = !active
-        toggle.text = if (active) "Выключить камеру" else "Включить камеру"
+        toggle.text = if (active) "Stop camera" else "Start camera"
         toggle.isEnabled = !pending
-        pairing.text = if (active && StreamService.code.isNotEmpty()) "Код  ${StreamService.code}" else "Код появится после включения"
+        pairing.text = if (active && StreamService.code.isNotEmpty()) "Code  ${StreamService.code}" else "The code appears after you start"
         currentUrl = if (active && cachedIp != null) "http://$cachedIp:${StreamService.PORT}/?code=${StreamService.code}" else ""
-        address.text = if (cachedIp == null) "Нет адреса Wi-Fi. Подключись к сети." else "Адрес телефона: $cachedIp:${StreamService.PORT}\n$currentUrl"
+        address.text = if (cachedIp == null) "No Wi-Fi address. Connect to a network." else "Phone address: $cachedIp:${StreamService.PORT}\n$currentUrl"
         val frames = StreamService.frames
         status.text = when {
-            StreamService.lastError != null -> "Ошибка: ${StreamService.lastError}"
-            StreamService.starting || pending -> "Запускаю камеру…"
-            StreamService.running -> "Передача · ${(frames - lastFrames).coerceAtLeast(0)} fps · зрителей: ${StreamService.viewers}"
-            else -> "Камера выключена"
+            StreamService.lastError != null -> "Error: ${StreamService.lastError}"
+            StreamService.starting || pending -> "Starting camera…"
+            StreamService.running -> "Streaming · ${(frames - lastFrames).coerceAtLeast(0)} fps · viewers: ${StreamService.viewers}"
+            else -> "Camera is off"
         }
         lastFrames = frames
     }

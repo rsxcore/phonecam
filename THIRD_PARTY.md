@@ -1,5 +1,7 @@
 # Third-party components
 
+[← Back to README](README.md)
+
 PhoneCam includes third-party code through its Rust and Android dependencies. Full resolved Rust versions are recorded in server/Cargo.lock; Android direct versions are in android/gradle/libs.versions.toml.
 
 | Component | Version | License | Project |
