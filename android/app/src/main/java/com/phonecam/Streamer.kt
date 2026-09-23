@@ -323,7 +323,7 @@ object Streamer {
             OrientationLock.PORTRAIT -> 0
         }
         val base = if (baseRotation >= 0) baseRotation else lens.sensorOrientation
-        rotation = if (lens.front) (base + device) % 360 else (base - device + 360) % 360
+        rotation = com.phonecam.stream.Orientation.streamRotation(base, device, lens.front)
     }
 
     private fun hello(): JSONObject = JSONObject()

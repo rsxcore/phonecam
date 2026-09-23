@@ -26,4 +26,13 @@ object Orientation {
         }
         return -1
     }
+
+    /**
+     * Clockwise rotation the PC applies to an encoded frame. [device] is the
+     * OrientationEventListener angle snapped to 0/90/180/270. Same sign
+     * convention as Camera2's JPEG_ORIENTATION: add it for back cameras,
+     * subtract it for front cameras, which face the other way.
+     */
+    fun streamRotation(base: Int, device: Int, front: Boolean): Int =
+        if (front) (base - device + 360) % 360 else (base + device) % 360
 }
