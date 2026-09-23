@@ -154,9 +154,9 @@
     <div class="gap"></div>
     <Segmented
       options={[
-        { value: "AUTO", label: "Auto rotate" },
-        { value: "LANDSCAPE", label: "Landscape" },
-        { value: "PORTRAIT", label: "Portrait" },
+        { value: "AUTO", label: "Auto", hint: "follows the phone" },
+        { value: "PORTRAIT", label: "Upright", hint: "phone stands tall" },
+        { value: "LANDSCAPE", label: "On its side", hint: "phone lies sideways" },
       ]}
       value={s.orientation}
       onchange={(v) => engine.set({ orientation: v as "AUTO" | "LANDSCAPE" | "PORTRAIT" })}

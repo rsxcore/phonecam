@@ -92,10 +92,15 @@ fun SettingsSheet(state: UiState, onApply: ((CameraSettings) -> CameraSettings) 
                 colors = SliderDefaults.colors(thumbColor = Palette.Accent, activeTrackColor = Palette.Accent, inactiveTrackColor = Palette.Outline),
             )
 
-            Section("Stream orientation")
+            Section("Picture orientation")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OrientationLock.entries.forEach { o ->
-                    Choice(o.name.lowercase().replaceFirstChar { it.uppercase() }, s.orientation == o) { onApply { it.copy(orientation = o) } }
+                // Named after how the phone stands, since that is what the lock assumes.
+                listOf(
+                    Triple(OrientationLock.AUTO, "Auto", "follows the phone"),
+                    Triple(OrientationLock.PORTRAIT, "Upright", "phone stands tall"),
+                    Triple(OrientationLock.LANDSCAPE, "On its side", "lies sideways"),
+                ).forEach { (o, label, hint) ->
+                    Choice(label, s.orientation == o, sub = hint) { onApply { it.copy(orientation = o) } }
                 }
             }
 
