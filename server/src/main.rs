@@ -1,4 +1,5 @@
 mod decoder;
+mod identity;
 mod nv12;
 mod proto;
 mod shm;
@@ -74,6 +75,16 @@ fn main() {
         "hevc": decoder::supports(proto::Codec::Hevc),
     }));
 
+    let identity = match identity::Identity::load_or_create() {
+        Ok(i) => i,
+        Err(e) => {
+            reporter.status(&format!("Cannot create the PC identity: {e}"));
+            std::process::exit(1);
+        }
+    };
+    let tls = identity.client_config().expect("TLS configuration");
+    reporter.emit(json!({ "event": "identity", "name": identity::computer_name(), "fingerprint": identity.fingerprint }));
+
     let (tx, rx) = mpsc::sync_channel::<Job>(16);
     let skip_until_key = Arc::new(AtomicBool::new(false));
     {
@@ -90,8 +101,8 @@ fn main() {
                 if serde_json::from_str::<Value>(&line).is_err() {
                     continue;
                 }
-                if let Some(sender) = control.lock().unwrap().as_mut() {
-                    let _ = sender.send(proto::CONTROL, line.as_bytes());
+                if let Some(sender) = control.lock().unwrap().as_ref() {
+                    sender.send(proto::CONTROL, line.as_bytes());
                 }
             }
         });
@@ -100,18 +111,12 @@ fn main() {
     loop {
         let target = match &address {
             Some(a) => Some(a.clone()),
-            None => {
-                reporter.status("Searching for your phone…");
-                proto::discover(Duration::from_millis(800)).into_iter().next().map(|(a, model)| {
-                    reporter.emit(json!({ "event": "found", "address": a, "model": model }));
-                    a
-                })
-            }
+            None => find_phone(&reporter),
         };
         let result = match target {
             Some(t) => {
                 reporter.status(&format!("Connecting to {t}…"));
-                receive(&t, &tx, &skip_until_key, &control, &reporter)
+                receive(&t, &tls, &identity, &tx, &skip_until_key, &control, &reporter)
             }
             None => Err("Phone not found. Open PhoneCam on the phone (same Wi-Fi).".into()),
         };
@@ -123,21 +128,73 @@ fn main() {
     }
 }
 
+/// Paired phones first (by the fingerprint prefix they announce), then the
+/// addresses that worked before, then any phone that answers, then a scan of
+/// the local network for when the firewall swallows discovery replies.
+fn find_phone(reporter: &Reporter) -> Option<String> {
+    reporter.status("Searching for your phone…");
+    let known = identity::phones();
+    let found = proto::discover(Duration::from_millis(800));
+    for f in &found {
+        reporter.emit(json!({ "event": "found", "address": f.address, "model": f.model }));
+    }
+    let paired = found.iter().find(|f| known.iter().any(|k| k.fingerprint.starts_with(&f.fingerprint_prefix)));
+    if let Some(f) = paired {
+        return Some(f.address.clone());
+    }
+    for last in known.iter().filter(|k| !k.address.is_empty()) {
+        if let Ok(addr) = last.address.parse() {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok() {
+                return Some(last.address.clone());
+            }
+        }
+    }
+    if let Some(f) = found.first() {
+        return Some(f.address.clone());
+    }
+    proto::scan_subnet(proto::DEFAULT_PORT).into_iter().next()
+}
+
 fn receive(
     address: &str,
+    tls: &Arc<rustls::ClientConfig>,
+    me: &identity::Identity,
     tx: &SyncSender<Job>,
     skip_until_key: &AtomicBool,
     control: &Mutex<Option<proto::Sender>>,
     reporter: &Reporter,
 ) -> Result<(), String> {
-    let mut conn = proto::Connection::open(address)?;
-    *control.lock().unwrap() = Some(conn.sender().map_err(|e| e.to_string())?);
-    reporter.emit(json!({ "event": "connected", "address": address }));
+    let mut conn = proto::Connection::open(address, tls.clone(), &identity::computer_name())?;
+    let phone_fp = conn.phone_fingerprint.clone();
+    let expected_code = identity::verification_code(&me.fingerprint, &phone_fp);
+    let mut mismatch = false;
+    let first = conn.handshake(&mut |p| match p {
+        proto::Pairing::Waiting(code) => {
+            // A device relaying the connection would see different certificates
+            // and therefore produce a different code.
+            mismatch = code != expected_code;
+            reporter.emit(json!({ "event": "pairing", "code": expected_code, "mismatch": mismatch }));
+        }
+    })?;
+    if mismatch {
+        return Err("Pairing codes differ: the connection may be intercepted".into());
+    }
+    *control.lock().unwrap() = Some(conn.sender());
+    reporter.emit(json!({ "event": "connected", "address": address, "fingerprint": phone_fp }));
+    let mut pending = Some(first);
     loop {
-        match conn.read().map_err(|e| e.to_string())? {
+        let message = match pending.take() {
+            Some(m) => m,
+            None => conn.read().map_err(|e| e.to_string())?,
+        };
+        match message {
             proto::Message::Hello(text) | proto::Message::State(text) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
                     let kind = if v.get("lenses").is_some() { "hello" } else { "state" };
+                    if kind == "hello" {
+                        let name = v.get("device").and_then(Value::as_str).unwrap_or("Phone").to_string();
+                        identity::remember(&identity::Phone { fingerprint: phone_fp.clone(), name, address: address.to_string() });
+                    }
                     reporter.emit(json!({ "event": kind, "data": v }));
                 }
             }

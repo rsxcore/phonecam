@@ -104,6 +104,24 @@ fun SettingsSheet(state: UiState, onApply: ((CameraSettings) -> CameraSettings) 
             if (lens?.eis == true && lens.modes.any { !it.highSpeed }) Toggle("Electronic stabilization (crops the frame)", s.eis) { v -> onApply { it.copy(eis = v) } }
             if (lens?.front == false) Toggle("Flashlight", s.torch) { v -> onApply { it.copy(torch = v) } }
 
+            Section("Paired computers")
+            val context = androidx.compose.ui.platform.LocalContext.current
+            var pcs by remember { androidx.compose.runtime.mutableStateOf(com.phonecam.net.Identity.trusted(context)) }
+            if (pcs.isEmpty()) Text("None yet. Open PhoneCam on your PC to pair.", style = MaterialTheme.typography.bodySmall, color = Palette.TextDim)
+            pcs.forEach { pc ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(pc.name, style = MaterialTheme.typography.bodyMedium)
+                        Text(pc.fingerprint.take(16).chunked(4).joinToString(" "), style = MaterialTheme.typography.labelSmall, color = Palette.TextDim)
+                    }
+                    Text("Forget", style = MaterialTheme.typography.labelLarge, color = Palette.Live,
+                        modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable {
+                            com.phonecam.net.Identity.forget(context, pc.fingerprint)
+                            pcs = com.phonecam.net.Identity.trusted(context)
+                        }.padding(8.dp))
+                }
+            }
+
             Section("Connection")
             Info("Phone address", state.address?.let { "$it:8080" } ?: "Not on Wi-Fi")
             Info("Connected PC", state.pc ?: "—")

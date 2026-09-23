@@ -47,7 +47,7 @@ unsafe fn create_gpu() -> windows::core::Result<Gpu> {
     )?;
     let device: ID3D11Device = device.unwrap();
     // The decoder uses the device from its own threads.
-    device.cast::<ID3D11Multithread>()?.SetMultithreadProtected(true);
+    let _ = device.cast::<ID3D11Multithread>()?.SetMultithreadProtected(true);
     let mut token = 0u32;
     let mut manager = None;
     MFCreateDXGIDeviceManager(&mut token, &mut manager)?;

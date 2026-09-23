@@ -39,6 +39,7 @@ data class UiState(
     val kbps: Int = 0,
     val dropped: Long = 0,
     val encoder: String = "",
+    val pairing: com.phonecam.net.PairRequest? = null,
 )
 
 /**
@@ -88,7 +89,9 @@ object Streamer {
                 _state.update { it.copy(lenses = lenses, settings = settings) }
                 logCapabilities(lenses)
                 val s = StreamServer(
+                    context = ctx,
                     hello = ::hello,
+                    onPairRequest = { request -> _state.update { it.copy(pairing = request) } },
                     onControl = { json -> json.optJSONObject("set")?.let { set -> apply { it.merge(set) } } },
                     onClient = { pc -> _state.update { it.copy(pc = pc, phase = phaseFor(pc)) } },
                     requestKeyFrame = { encoder?.requestKeyFrame() },

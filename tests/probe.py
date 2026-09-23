@@ -2,12 +2,35 @@
 
 Usage: python tests/probe.py HOST[:PORT] SECONDS [out.h264] [--set '{"fps":60}']
 Use `adb forward tcp:8080 tcp:8080` and HOST=127.0.0.1 for USB.
+
+Uses the PC identity phonecam-server created in %APPDATA%\PhoneCam, so the
+phone must already trust this PC (run phonecam-server once and approve it).
 """
+import base64
 import json
+import os
 import socket
+import ssl
 import struct
 import sys
+import tempfile
 import time
+
+
+def tls_wrap(sock):
+    folder = os.path.join(os.environ["APPDATA"], "PhoneCam")
+    cert = ssl.DER_cert_to_PEM_cert(open(os.path.join(folder, "identity.crt"), "rb").read())
+    key = base64.encodebytes(open(os.path.join(folder, "identity.key"), "rb").read()).decode()
+    pem = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+    pem.write(cert + "-----BEGIN PRIVATE KEY-----\n" + key + "-----END PRIVATE KEY-----\n")
+    pem.close()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(pem.name)
+    os.unlink(pem.name)
+    return ctx.wrap_socket(sock, server_hostname="phonecam.local")
 
 
 def read_exact(s, n):
@@ -30,6 +53,9 @@ def main():
 
     s = socket.create_connection((host, int(port or 8080)), timeout=5)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s = tls_wrap(s)
+    hello = json.dumps({"name": "probe"}).encode()
+    s.sendall(struct.pack("<BI", 0x05, len(hello)) + hello)
     magic, version, _ = struct.unpack("<4sHH", read_exact(s, 8))
     assert magic == b"PCAM", magic
     print(f"protocol v{version}")

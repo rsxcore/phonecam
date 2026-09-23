@@ -39,6 +39,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Cameraswitch
+import androidx.compose.material.icons.rounded.Computer
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Tune
@@ -156,6 +157,7 @@ fun CameraScreen(
         }
 
         if (settingsOpen) SettingsSheet(state, onApply) { settingsOpen = false }
+        state.pairing?.let { PairingDialog(it) }
         if (dimmed) DimOverlay(state) { onDim(false) }
     }
 }
@@ -318,4 +320,53 @@ fun ChipRow(content: @Composable () -> Unit) {
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) { content() }
+}
+
+/** First connection from a PC: the only moment PhoneCam ever asks anything. */
+@Composable
+private fun PairingDialog(request: com.phonecam.net.PairRequest) {
+    Box(
+        Modifier.fillMaxSize().background(Color(0xB3000000))
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {},
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier.padding(24.dp).clip(RoundedCornerShape(28.dp)).background(Palette.Surface)
+                .border(1.dp, Palette.Outline, RoundedCornerShape(28.dp)).padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Box(Modifier.size(56.dp).clip(CircleShape).background(Palette.SurfaceHigh), contentAlignment = Alignment.Center) {
+                Icon(androidx.compose.material.icons.Icons.Rounded.Computer, null, tint = Palette.Accent, modifier = Modifier.size(28.dp))
+            }
+            Spacer(Modifier.height(16.dp))
+            Text("Connect to this PC?", style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(6.dp))
+            Text("“${request.pcName}” wants to use your camera.", style = MaterialTheme.typography.bodyMedium, color = Palette.TextDim)
+            Spacer(Modifier.height(20.dp))
+            Text(
+                request.code.chunked(3).joinToString(" "),
+                style = MaterialTheme.typography.titleLarge.copy(fontSize = androidx.compose.ui.unit.TextUnit(34f, androidx.compose.ui.unit.TextUnitType.Sp), letterSpacing = androidx.compose.ui.unit.TextUnit(4f, androidx.compose.ui.unit.TextUnitType.Sp)),
+                fontWeight = FontWeight.Bold, color = Palette.Text,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text("Make sure your PC shows the same code.", style = MaterialTheme.typography.bodySmall, color = Palette.TextDim)
+            Spacer(Modifier.height(24.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                DialogButton("Deny", primary = false, modifier = Modifier.weight(1f)) { request.decide(false) }
+                DialogButton("Allow", primary = true, modifier = Modifier.weight(1f)) { request.decide(true) }
+            }
+            Spacer(Modifier.height(10.dp))
+            Text("You only do this once per PC.", style = MaterialTheme.typography.labelSmall, color = Palette.TextDim)
+        }
+    }
+}
+
+@Composable
+private fun DialogButton(label: String, primary: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    Box(
+        modifier.height(52.dp).clip(CircleShape).background(if (primary) Palette.Accent else Palette.SurfaceHigh).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, style = MaterialTheme.typography.labelLarge, color = if (primary) Palette.Black else Palette.Text)
+    }
 }
