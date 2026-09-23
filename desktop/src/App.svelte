@@ -9,6 +9,18 @@
   import logo from "../../assets/icon.svg";
 
   let settingsOpen = $state(false);
+  let fixing = $state(false);
+
+  async function fixSystem() {
+    fixing = true;
+    try {
+      await engine.registerSystem();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      fixing = false;
+    }
+  }
 
   onMount(() => {
     engine.start();
@@ -117,9 +129,16 @@
           {#if engine.stats}{engine.stats.decodeMs.toFixed(1)}<small> ms{engine.decoder.includes("GPU") ? " · GPU" : ""}</small>{:else}<span class="none">—</span>{/if}
         </div>
       </div>
-      <div class="tile camera" class:ok={engine.camera?.ok}>
+      <div class="tile camera" class:ok={engine.camera?.ok && engine.camera?.system}>
         <div class="k"><MonitorPlay size={14} /> Virtual camera</div>
-        <div class="v small">{engine.camera?.ok ? "“PhoneCam” is ready" : engine.camera?.text ?? "Installing…"}</div>
+        {#if engine.camera?.ok && !engine.camera?.system}
+          <div class="fix">
+            <span>Hidden from apps run as admin (OBS)</span>
+            <button class="primary small-btn" disabled={fixing} onclick={fixSystem}>{fixing ? "…" : "Fix"}</button>
+          </div>
+        {:else}
+          <div class="v small">{engine.camera?.ok ? "“PhoneCam” is ready" : engine.camera?.text ?? "Installing…"}</div>
+        {/if}
       </div>
     </footer>
   </main>
@@ -414,6 +433,22 @@
     font-family: var(--sans);
     font-size: 14px;
     margin-top: 10px;
+  }
+  .fix {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
+    font-size: 12.5px;
+    color: var(--accent);
+  }
+  .fix span {
+    flex: 1;
+    line-height: 1.3;
+  }
+  .small-btn {
+    height: 30px;
+    padding: 0 14px;
   }
   .tile.camera.ok .k :global(svg) {
     color: var(--ok);

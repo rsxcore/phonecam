@@ -15,7 +15,7 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ring = "0.17"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 [profile.release]
 opt-level = 3

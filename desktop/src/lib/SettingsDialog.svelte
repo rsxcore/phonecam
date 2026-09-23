@@ -89,6 +89,9 @@
         Shows up as <b>PhoneCam</b> in OBS, Discord, Zoom and browsers. Pick 1920×1080 at 60 fps in OBS for the smoothest video.
       </p>
       <div class="inline">
+        <button class="ghost" onclick={async () => { try { message = (await engine.registerSystem()) ? "Registered for all apps, including ones run as administrator. Restart OBS." : "Registration did not take effect."; } catch (e) { message = String(e); } }}>
+          <MonitorPlay size={14} /> Make visible to admin apps
+        </button>
         <button class="ghost" onclick={reinstall}><RefreshCw size={14} /> Repair</button>
         <button class="ghost danger" onclick={uninstall}><Trash2 size={14} /> Remove</button>
       </div>

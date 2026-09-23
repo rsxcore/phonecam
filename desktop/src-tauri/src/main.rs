@@ -119,6 +119,13 @@ fn uninstall_camera() -> Result<(), String> {
     vcam::uninstall()
 }
 
+/// Makes the camera visible to apps running as administrator (one UAC prompt).
+#[tauri::command]
+async fn register_camera_system() -> Result<bool, String> {
+    vcam::register_system_elevated()?;
+    Ok(vcam::system_registered())
+}
+
 /// Binary preview packets: `0x10 codec w h fps` for a new stream, `0x11 flags
 /// pts rotation data` per frame. Mirrors the phone protocol so the page can
 /// feed WebCodecs directly.
@@ -193,6 +200,13 @@ fn show_main(app: &AppHandle) {
 }
 
 fn main() {
+    // Elevated helper mode, started by `register_camera_system`.
+    if std::env::args().any(|a| a == "--register-system") {
+        std::process::exit(match vcam::register_system() {
+            Ok(()) => 0,
+            Err(_) => 2,
+        });
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .manage(AppState::default())
@@ -207,13 +221,17 @@ fn main() {
             phones,
             forget_phone,
             reinstall_camera,
-            uninstall_camera
+            uninstall_camera,
+            register_camera_system
         ])
         .setup(|app| {
             let handle = app.handle().clone();
             let camera = vcam::install();
             let camera_event = match &camera {
-                Ok(path) => json!({ "event": "camera", "ok": true, "path": path.display().to_string() }),
+                Ok(path) => json!({
+                    "event": "camera", "ok": true, "path": path.display().to_string(),
+                    "system": vcam::system_registered(),
+                }),
                 Err(e) => json!({ "event": "camera", "ok": false, "text": e }),
             };
             app.state::<AppState>().history.lock().unwrap().push(camera_event);

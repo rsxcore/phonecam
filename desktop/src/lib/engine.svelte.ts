@@ -73,7 +73,7 @@ class EngineStore {
   dropped = $state(0);
   encoder = $state("");
   decoder = $state("");
-  camera = $state<{ ok: boolean; text?: string; path?: string } | null>(null);
+  camera = $state<{ ok: boolean; text?: string; path?: string; system?: boolean } | null>(null);
   codecs = $state<{ h264: boolean; hevc: boolean }>({ h264: true, hevc: false });
   pcName = $state("");
   testPattern = $state(false);
@@ -116,6 +116,12 @@ class EngineStore {
 
   connect(address: string | null) {
     return invoke("connect", { address });
+  }
+
+  async registerSystem() {
+    const ok = await invoke<boolean>("register_camera_system");
+    if (this.camera) this.camera = { ...this.camera, system: ok };
+    return ok;
   }
 
   toggleTestPattern() {
@@ -167,7 +173,7 @@ class EngineStore {
         this.status = e.text;
         break;
       case "camera":
-        this.camera = { ok: e.ok, text: e.text, path: e.path };
+        this.camera = { ok: e.ok, text: e.text, path: e.path, system: e.system };
         break;
       case "codecs":
         this.codecs = { h264: e.h264, hevc: e.hevc };
