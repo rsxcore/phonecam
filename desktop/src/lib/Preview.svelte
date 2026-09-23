@@ -22,6 +22,8 @@
     let latest: VideoFrame | null = null;
     let raf = 0;
 
+    const log = (line: string) => invoke("js_log", { line: `${new Date().toISOString()} ${line}` });
+    let outputs = 0;
     const reset = () => {
       try {
         decoder?.close();
@@ -71,11 +73,11 @@
       return "avc1.640028";
     };
 
-    const channel = new Channel<ArrayBuffer>();
-    channel.onmessage = (buffer) => {
+    const onPacket = (buffer: ArrayBuffer) => {
       const bytes = new Uint8Array(buffer);
       const view = new DataView(buffer);
       if (bytes[0] === 0x10) {
+        log(`config packet codec=${bytes[1]}`);
         codec = bytes[1];
         reset();
         return;
@@ -90,11 +92,16 @@
         const config: VideoDecoderConfig = { codec: codecString(data), optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" };
         decoder = new VideoDecoder({
           output: (frame) => {
+            if (outputs++ % 300 === 0) log(`output #${outputs} ${frame.displayWidth}x${frame.displayHeight}`);
             latest?.close();
             latest = frame;
           },
-          error: () => reset(),
+          error: (e) => {
+            log(`decoder error: ${e.message}`);
+            reset();
+          },
         });
+        log(`configure ${config.codec}`);
         try {
           decoder.configure(config);
         } catch (err) {
@@ -111,7 +118,8 @@
       }
       try {
         decoder?.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: pts, data }));
-      } catch {
+      } catch (err) {
+        log(`decode threw: ${err}`);
         reset();
       }
     };
@@ -122,6 +130,11 @@
       if (want && !running) {
         running = true;
         waitingForKey = true;
+        // A fresh channel every time: Tauri unregisters a channel's handler once
+        // the Rust side drops it, so a reused one would silently receive nothing.
+        const channel = new Channel<ArrayBuffer>();
+        channel.onmessage = onPacket;
+        log("preview start");
         invoke("start_preview", { channel });
       } else if (!want && running) {
         running = false;

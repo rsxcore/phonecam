@@ -71,6 +71,8 @@ object Streamer {
     @Volatile private var deviceDegrees = 0
     @Volatile private var lastLandscape = 90
     @Volatile private var rotation = 0
+    /** Rotation measured from the camera's own preview transform, or -1 until the first frame. */
+    @Volatile private var baseRotation = -1
 
     private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
     private var recoveries = 0
@@ -185,6 +187,7 @@ object Streamer {
         val mode = lens.modes.first { it.width == st.settings.width && it.height == st.settings.height && it.fps == st.settings.fps }
         engine?.close()
         relay?.release(); relay = null
+        baseRotation = -1
         encoder?.release(); encoder = null
         try {
             val codec = if (VideoEncoder.supports(st.settings.codec, mode.width, mode.height)) st.settings.codec
@@ -202,7 +205,9 @@ object Streamer {
             // Announce the new stream now: some encoders (Qualcomm c2) never emit a
             // separate codec-config buffer and put SPS/PPS into each key frame instead.
             server?.setConfig(Protocol.config(codec.wire, mode.width, mode.height, mode.fps, ByteArray(0)))
-            val r = GlRelay(mode.width, mode.height, mode.fps)
+            val r = GlRelay(mode.width, mode.height, mode.fps) { base ->
+                handler?.post { baseRotation = base; updateRotation() }
+            }
             relay = r
             r.setEncoder(enc.inputSurface)
             preview?.let { r.setPreview(it, previewSize.first, previewSize.second) }
@@ -317,8 +322,8 @@ object Streamer {
             OrientationLock.LANDSCAPE -> lastLandscape
             OrientationLock.PORTRAIT -> 0
         }
-        rotation = if (lens.front) (lens.sensorOrientation + device) % 360
-            else (lens.sensorOrientation - device + 360) % 360
+        val base = if (baseRotation >= 0) baseRotation else lens.sensorOrientation
+        rotation = if (lens.front) (base + device) % 360 else (base - device + 360) % 360
     }
 
     private fun hello(): JSONObject = JSONObject()

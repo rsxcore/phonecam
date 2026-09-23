@@ -30,7 +30,12 @@ import java.util.concurrent.TimeUnit
  * with a jitter tolerance instead of by the encoder, which on some chips
  * ignores the requested rate.
  */
-class GlRelay(private val width: Int, private val height: Int, fps: Int) {
+class GlRelay(
+    private val width: Int,
+    private val height: Int,
+    fps: Int,
+    private val onBaseRotation: (Int) -> Unit = {},
+) {
     private val thread = HandlerThread("phonecam-gl").apply { start() }
     private val handler = Handler(thread.looper)
     private val minIntervalNs = (1_000_000_000L / fps) * 3 / 4
@@ -50,6 +55,7 @@ class GlRelay(private val width: Int, private val height: Int, fps: Int) {
 
     private val stMatrix = FloatArray(16)
     private var lastEncodedNs = 0L
+    private var loggedMatrix = false
     @Volatile private var released = false
 
     /** Frames drawn to the encoder, for statistics. */
@@ -110,6 +116,12 @@ class GlRelay(private val width: Int, private val height: Int, fps: Int) {
         surfaceTexture.updateTexImage()
         val ts = surfaceTexture.timestamp
         surfaceTexture.getTransformMatrix(stMatrix)
+        if (!loggedMatrix) {
+            loggedMatrix = true
+            val base = baseRotation(stMatrix)
+            Log.i(TAG, "SurfaceTexture matrix ${stMatrix.joinToString { "%.1f".format(it) }} -> base rotation $base")
+            if (base >= 0) onBaseRotation(base)
+        }
 
         // Encoder: raw sensor orientation, paced to the target rate. A 3/4
         // interval threshold keeps every frame of a jittery 30 fps camera but
@@ -204,6 +216,33 @@ class GlRelay(private val width: Int, private val height: Int, fps: Int) {
 
     companion object {
         private const val TAG = "PhoneCam.GL"
+
+        /**
+         * Clockwise rotation that makes the encoded (sensor-oriented) image
+         * upright in the phone's natural orientation, read from the transform
+         * the camera framework itself gives the preview. More reliable than
+         * SENSOR_ORIENTATION: front cameras are additionally mirrored for the
+         * preview, and HALs differ in how they combine the two.
+         */
+        fun baseRotation(st: FloatArray): Int {
+            fun display(s: Float, t: Float): Pair<Int, Int> {
+                val x = st[0] * s + st[4] * t + st[12]
+                val y = st[1] * s + st[5] * t + st[13]
+                return Math.round(x) to Math.round(1 - y) // back into encoded-image coordinates
+            }
+            val rotations = mapOf<Int, (Int, Int) -> Pair<Int, Int>>(
+                0 to { s, t -> s to t }, 90 to { s, t -> 1 - t to s },
+                180 to { s, t -> 1 - s to 1 - t }, 270 to { s, t -> t to 1 - s },
+            )
+            val probes = listOf(0 to 0, 1 to 0, 0 to 1)
+            for ((angle, r) in rotations) {
+                val plain = probes.all { (s, t) -> display(s.toFloat(), t.toFloat()) == r(s, t) }
+                val mirrored = probes.all { (s, t) -> display(s.toFloat(), t.toFloat()) == r(s, t).let { (x, y) -> 1 - x to y } }
+                if (plain || mirrored) return angle
+            }
+            return -1
+        }
+
         private const val EGL_RECORDABLE_ANDROID = 0x3142
 
         private val IDENTITY = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }

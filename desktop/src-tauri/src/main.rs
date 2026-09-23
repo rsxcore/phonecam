@@ -83,6 +83,16 @@ fn stop_preview(state: State<AppState>) {
     }
 }
 
+/// Diagnostics from the page (the release build has no devtools).
+#[tauri::command]
+fn js_log(line: String) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("phonecam-ui.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 #[tauri::command]
 fn phones() -> Vec<PairedPhone> {
     identity::phones()
@@ -188,6 +198,7 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             ready,
+            js_log,
             control,
             connect,
             test_pattern,
