@@ -1,6 +1,7 @@
 <resources>
-<string name="app_name">PhoneCam</string>
-<string name="notification_channel">Video streaming</string>
-<string name="notification_title">PhoneCam is streaming video</string>
-<string name="notification_stop">Stop</string>
+    <string name="app_name">PhoneCam</string>
+    <string name="notification_channel">Video streaming</string>
+    <string name="notification_title">PhoneCam is live</string>
+    <string name="notification_text">Your camera is available to your PC</string>
+    <string name="notification_stop">Stop</string>
 </resources>

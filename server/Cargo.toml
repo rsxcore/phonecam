@@ -1,23 +1,29 @@
 [package]
 name = "phonecam-server"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
 description = "Receives the phone camera stream and feeds the PhoneCam virtual webcam"
 publish = false
 
 [dependencies]
-# Windows-only on purpose: the shared memory handoff to the DirectShow filter is
-# the whole reason this is not portable, and pretending otherwise would add a
-# layer that never gets used.
+# Windows-only on purpose: Media Foundation decoding and the shared memory
+# handoff to the DirectShow filter are the whole job.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
-    "Win32_Security", # CreateFileMappingW is gated behind this
+    "Win32_Security",
     "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_System_SystemInformation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_MediaFoundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
-zune-core = "0.5.1"
-zune-jpeg = "0.5.15"
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

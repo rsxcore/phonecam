@@ -1,5 +1,5 @@
-// Top-level build file. Only the Android application plugin is needed: AGP 9
-// compiles Kotlin itself, so there is no separate Kotlin plugin to apply.
+// AGP 9 compiles Kotlin itself; only the Compose compiler plugin is added on top.
 plugins {
   alias(libs.plugins.android.application) apply false
+  alias(libs.plugins.compose.compiler) apply false
 }

@@ -35,16 +35,22 @@ static const GUID CLSID_PhoneCamFilter = {
 static const wchar_t kFilterName[] = L"PhoneCam";
 static const wchar_t kPinName[] = L"Capture";
 
-/* Sizes offered to the graph. Apps overwhelmingly default to the first entry,
- * so 1080p leads; the phone can always send something smaller and get scaled. */
-static const struct {
-    UINT w, h;
-} kCaps[] = {{1280, 720}, {1920, 1080}, {640, 480}};
+/* Formats offered to the graph. Apps overwhelmingly default to the first
+ * entry, so 1080p60 NV12 leads: it is what OBS handles natively, with no
+ * colour conversion anywhere between the phone's encoder and OBS. RGB32 stays
+ * for older apps that only speak RGB. Portrait sizes exist for vertical video. */
+struct Cap {
+    UINT w, h, fps;
+    bool nv12;
+};
+static const Cap kCaps[] = {
+    {1920, 1080, 60, true}, {1920, 1080, 30, true}, {1280, 720, 60, true},  {1280, 720, 30, true},
+    {3840, 2160, 30, true}, {1080, 1920, 60, true}, {1080, 1920, 30, true}, {1920, 1080, 30, false},
+    {1280, 720, 30, false},
+};
 static const int kCapCount = (int)(sizeof(kCaps) / sizeof(kCaps[0]));
 
-static const UINT kDefaultWidth = 1280;
-static const UINT kDefaultHeight = 720;
-static const UINT kFps = 30;
+static const DWORD FOURCC_NV12 = MAKEFOURCC('N', 'V', '1', '2');
 
 static HINSTANCE g_hInst = NULL;
 static LONG g_cLockedObjects = 0;
@@ -70,25 +76,48 @@ static void FreeMediaTypeContents(AM_MEDIA_TYPE* pmt) {
     }
 }
 
-static bool IsAcceptableFormat(const AM_MEDIA_TYPE* pmt) {
+static UINT FrameBytes(UINT w, UINT h, bool nv12) { return nv12 ? w * h * 3 / 2 : w * h * 4; }
+
+static bool SizeOk(UINT w, UINT h) {
+    return w >= 2 && h >= 2 && w % 2 == 0 && h % 2 == 0 && w <= PHONECAM_MAX_WIDTH &&
+           h <= PHONECAM_MAX_HEIGHT && (UINT64)w * h <= PHONECAM_MAX_PIXELS;
+}
+
+/* Parses a media type we can produce. Out-params are optional. */
+static bool ParseFormat(const AM_MEDIA_TYPE* pmt, UINT* w, UINT* h, UINT* fps, bool* nv12) {
     if (!pmt) return false;
     if (pmt->majortype != MEDIATYPE_Video) return false;
     if (pmt->formattype != FORMAT_VideoInfo) return false;
-    if (pmt->subtype != MEDIASUBTYPE_RGB32) return false;
     if (pmt->cbFormat < sizeof(VIDEOINFOHEADER) || !pmt->pbFormat) return false;
-    const BITMAPINFOHEADER& b = ((VIDEOINFOHEADER*)pmt->pbFormat)->bmiHeader;
-    if (b.biWidth <= 0 || b.biWidth > 1920 || b.biHeight == 0 || b.biHeight < -1080 || b.biHeight > 1080) return false;
-    if (b.biPlanes != 1 || b.biBitCount != 32 || b.biCompression != BI_RGB) return false;
+    const VIDEOINFOHEADER* vih = (const VIDEOINFOHEADER*)pmt->pbFormat;
+    const BITMAPINFOHEADER& b = vih->bmiHeader;
+    bool isNv12;
+    if (pmt->subtype == MEDIASUBTYPE_NV12 && b.biCompression == FOURCC_NV12 && b.biBitCount == 12) isNv12 = true;
+    else if (pmt->subtype == MEDIASUBTYPE_RGB32 && b.biCompression == BI_RGB && b.biBitCount == 32) isNv12 = false;
+    else return false;
+    if (b.biWidth <= 0 || b.biHeight == 0 || b.biPlanes != 1) return false;
+    if (isNv12 && b.biHeight < 0) return false; /* YUV is always top-down */
+    const UINT ww = (UINT)b.biWidth, hh = (UINT)abs(b.biHeight);
+    if (!SizeOk(ww, hh)) return false;
+    UINT f = vih->AvgTimePerFrame > 0 ? (UINT)((10000000LL + vih->AvgTimePerFrame / 2) / vih->AvgTimePerFrame) : 30;
+    if (f < 1) f = 1;
+    if (f > 60) f = 60;
+    if (w) *w = ww;
+    if (h) *h = hh;
+    if (fps) *fps = f;
+    if (nv12) *nv12 = isNv12;
     return true;
 }
 
-static void FillVideoInfoHeader(AM_MEDIA_TYPE* pmt, UINT w, UINT h) {
+static bool IsAcceptableFormat(const AM_MEDIA_TYPE* pmt) { return ParseFormat(pmt, NULL, NULL, NULL, NULL); }
+
+static void FillVideoInfoHeader(AM_MEDIA_TYPE* pmt, UINT w, UINT h, UINT fps, bool nv12) {
     pmt->majortype = MEDIATYPE_Video;
-    pmt->subtype = MEDIASUBTYPE_RGB32;
+    pmt->subtype = nv12 ? MEDIASUBTYPE_NV12 : MEDIASUBTYPE_RGB32;
     pmt->formattype = FORMAT_VideoInfo;
     pmt->bFixedSizeSamples = TRUE;
     pmt->bTemporalCompression = FALSE;
-    pmt->lSampleSize = (ULONG)(w * h * 4);
+    pmt->lSampleSize = (ULONG)FrameBytes(w, h, nv12);
     pmt->pUnk = NULL;
     pmt->cbFormat = sizeof(VIDEOINFOHEADER);
     pmt->pbFormat = (BYTE*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER));
@@ -96,8 +125,8 @@ static void FillVideoInfoHeader(AM_MEDIA_TYPE* pmt, UINT w, UINT h) {
 
     VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)pmt->pbFormat;
     ZeroMemory(vih, sizeof(VIDEOINFOHEADER));
-    vih->AvgTimePerFrame = 10000000LL / kFps;
-    vih->dwBitRate = (DWORD)(w * h * 4 * 8 * kFps);
+    vih->AvgTimePerFrame = 10000000LL / fps;
+    vih->dwBitRate = (DWORD)((UINT64)FrameBytes(w, h, nv12) * 8 * fps);
     vih->rcSource.right = w;
     vih->rcSource.bottom = h;
     vih->rcTarget = vih->rcSource;
@@ -105,105 +134,128 @@ static void FillVideoInfoHeader(AM_MEDIA_TYPE* pmt, UINT w, UINT h) {
     BITMAPINFOHEADER* bih = &vih->bmiHeader;
     bih->biSize = sizeof(BITMAPINFOHEADER);
     bih->biWidth = (LONG)w;
-    /* Negative height = rows run top-down, which is how the phone sends them
-     * and how the shared memory stores them. Flip the sign if the image ever
-     * comes out upside down. */
-    bih->biHeight = -(LONG)h;
+    /* RGB: negative height = top-down rows, like the shared memory. YUV
+     * formats are top-down by definition and must use a positive height. */
+    bih->biHeight = nv12 ? (LONG)h : -(LONG)h;
     bih->biPlanes = 1;
-    bih->biBitCount = 32;
-    bih->biCompression = BI_RGB;
-    bih->biSizeImage = w * h * 4;
+    bih->biBitCount = nv12 ? 12 : 32;
+    bih->biCompression = nv12 ? FOURCC_NV12 : BI_RGB;
+    bih->biSizeImage = FrameBytes(w, h, nv12);
 }
 
 /* ------------------------------------------------------------------ */
 /* Pixel plumbing                                                      */
 /* ------------------------------------------------------------------ */
 
-static void FillNoSignal(BYTE* dst, UINT stride, UINT w, UINT h) {
-    /* Deliberately not black: a dark blue-grey tells you at a glance that the
-     * filter is loaded and running, as opposed to the app having failed to
-     * open the camera at all. */
+/* Deliberately not black: a dark blue-grey tells you at a glance that the
+ * filter is loaded and running, as opposed to the app having failed to open
+ * the camera at all. */
+static void FillNoSignal(BYTE* dst, UINT w, UINT h, bool nv12) {
+    if (nv12) {
+        memset(dst, 30, (size_t)w * h);
+        BYTE* uv = dst + (size_t)w * h;
+        for (size_t i = 0; i < (size_t)w * h / 2; i += 2) {
+            uv[i] = 136;
+            uv[i + 1] = 124;
+        }
+        return;
+    }
     const UINT32 px = 0x001E1418u; /* BGRA */
-    for (UINT y = 0; y < h; ++y) {
-        UINT32* row = (UINT32*)(dst + (size_t)y * stride);
-        for (UINT x = 0; x < w; ++x) row[x] = px;
+    UINT32* p = (UINT32*)dst;
+    for (size_t i = 0; i < (size_t)w * h; ++i) p[i] = px;
+}
+
+/* Where the source lands inside the destination once scaled to fit with the
+ * aspect ratio preserved. Offsets and sizes are even so NV12 chroma lines up. */
+struct Fit {
+    UINT ox, oy, ow, oh;
+};
+
+static Fit FitInside(UINT sw, UINT sh, UINT dw, UINT dh) {
+    Fit f;
+    if ((UINT64)sw * dh > (UINT64)sh * dw) { /* wider than the target: bars top and bottom */
+        f.ow = dw;
+        f.oh = (UINT)((UINT64)sh * dw / sw) & ~1u;
+    } else {
+        f.oh = dh;
+        f.ow = (UINT)((UINT64)sw * dh / sh) & ~1u;
+    }
+    if (f.ow < 2) f.ow = 2;
+    if (f.oh < 2) f.oh = 2;
+    f.ox = ((dw - f.ow) / 2) & ~1u;
+    f.oy = ((dh - f.oh) / 2) & ~1u;
+    return f;
+}
+
+/* NV12 → NV12 with aspect-preserving scaling. Same size is a plain copy, the
+ * common case: phone 1080p into a 1080p camera. Scaling uses bilinear luma
+ * and nearest chroma, which is plenty for a picture that is being letterboxed
+ * or downscaled anyway. */
+static void ScaleNv12(const BYTE* src, UINT sw, UINT sh, BYTE* dst, UINT dw, UINT dh) {
+    if (sw == dw && sh == dh) {
+        memcpy(dst, src, (size_t)dw * dh * 3 / 2);
+        return;
+    }
+    const Fit f = FitInside(sw, sh, dw, dh);
+    memset(dst, 16, (size_t)dw * dh);
+    memset(dst + (size_t)dw * dh, 128, (size_t)dw * dh / 2);
+
+    const UINT64 stepX = ((UINT64)sw << 16) / f.ow, stepY = ((UINT64)sh << 16) / f.oh;
+    for (UINT y = 0; y < f.oh; ++y) {
+        UINT64 fy = y * stepY + stepY / 2;
+        fy = fy > 32768 ? fy - 32768 : 0;
+        UINT y0 = (UINT)(fy >> 16);
+        if (y0 >= sh - 1) y0 = sh - 2;
+        const UINT wy = (UINT)(fy & 0xFFFF) >> 8;
+        const BYTE* r0 = src + (size_t)y0 * sw;
+        const BYTE* r1 = r0 + sw;
+        BYTE* out = dst + (size_t)(y + f.oy) * dw + f.ox;
+        for (UINT x = 0; x < f.ow; ++x) {
+            UINT64 fx = x * stepX + stepX / 2;
+            fx = fx > 32768 ? fx - 32768 : 0;
+            UINT x0 = (UINT)(fx >> 16);
+            if (x0 >= sw - 1) x0 = sw - 2;
+            const UINT wx = (UINT)(fx & 0xFFFF) >> 8;
+            const UINT top = r0[x0] * (256 - wx) + r0[x0 + 1] * wx;
+            const UINT bot = r1[x0] * (256 - wx) + r1[x0 + 1] * wx;
+            out[x] = (BYTE)((top * (256 - wy) + bot * wy + 32768) >> 16);
+        }
+    }
+    const BYTE* suv = src + (size_t)sw * sh;
+    BYTE* duv = dst + (size_t)dw * dh;
+    for (UINT y = 0; y < f.oh / 2; ++y) {
+        const UINT sy = (UINT)((UINT64)y * sh / f.oh);
+        const UINT16* srow = (const UINT16*)(suv + (size_t)sy * sw);
+        UINT16* drow = (UINT16*)(duv + (size_t)(y + f.oy / 2) * dw + f.ox);
+        for (UINT x = 0; x < f.ow / 2; ++x) {
+            drow[x] = srow[(UINT)((UINT64)x * sw / f.ow)];
+        }
     }
 }
 
-/* Bilinear, with the aspect ratio preserved and the remainder filled black.
- * A straight stretch would distort the picture, and the sizes only differ when
- * the app negotiated something other than what the phone is sending. */
-static void BlitScaled(BYTE* dst, UINT dstStride, UINT dstW, UINT dstH,
-                       const BYTE* src, UINT srcW, UINT srcH, UINT srcStride) {
-    if (srcW == 0 || srcH == 0) {
-        FillNoSignal(dst, dstStride, dstW, dstH);
-        return;
-    }
+static inline BYTE Clamp255(int v) { return (BYTE)(v < 0 ? 0 : v > 255 ? 255 : v); }
 
-    if (srcW == dstW && srcH == dstH) {
-        for (UINT y = 0; y < dstH; ++y) {
-            memcpy(dst + (size_t)y * dstStride, src + (size_t)y * srcStride,
-                   (size_t)dstW * 4);
-        }
-        return;
-    }
-
-    const double scale = min((double)dstW / srcW, (double)dstH / srcH);
-    const UINT outW = (UINT)(srcW * scale + 0.5);
-    const UINT outH = (UINT)(srcH * scale + 0.5);
-    const UINT offX = (dstW - outW) / 2;
-    const UINT offY = (dstH - outH) / 2;
-
-    /* Letterbox bars. */
-    const UINT32 black = 0x00000000u;
-    for (UINT y = 0; y < dstH; ++y) {
-        UINT32* row = (UINT32*)(dst + (size_t)y * dstStride);
-        const bool inside = (y >= offY && y < offY + outH);
-        for (UINT x = 0; x < dstW; ++x) {
-            if (!inside || x < offX || x >= offX + outW) row[x] = black;
-        }
-    }
-
-    const double invScale = 1.0 / scale;
-    for (UINT y = 0; y < outH; ++y) {
-        const double sy = max(0.0, min((double)srcH - 1, (y + 0.5) * invScale - 0.5));
-        int y0 = (int)sy;
-        if (y0 < 0) y0 = 0;
-        int y1 = y0 + 1;
-        if (y1 >= (int)srcH) y1 = (int)srcH - 1;
-        const double fy = sy - y0;
-        if (y0 >= (int)srcH) y0 = (int)srcH - 1;
-
-        const UINT32* row0 = (const UINT32*)(src + (size_t)y0 * srcStride);
-        const UINT32* row1 = (const UINT32*)(src + (size_t)y1 * srcStride);
-        UINT32* out = (UINT32*)(dst + (size_t)(y + offY) * dstStride) + offX;
-
-        for (UINT x = 0; x < outW; ++x) {
-            const double sx = max(0.0, min((double)srcW - 1, (x + 0.5) * invScale - 0.5));
-            int x0 = (int)sx;
-            if (x0 < 0) x0 = 0;
-            int x1 = x0 + 1;
-            if (x1 >= (int)srcW) x1 = (int)srcW - 1;
-            if (x0 >= (int)srcW) x0 = (int)srcW - 1;
-            const double fx = sx - x0;
-
-            const UINT32 p00 = row0[x0], p01 = row0[x1];
-            const UINT32 p10 = row1[x0], p11 = row1[x1];
-
-            UINT32 result = 0;
-            for (int shift = 0; shift < 32; shift += 8) {
-                const double c00 = (double)((p00 >> shift) & 0xFF);
-                const double c01 = (double)((p01 >> shift) & 0xFF);
-                const double c10 = (double)((p10 >> shift) & 0xFF);
-                const double c11 = (double)((p11 >> shift) & 0xFF);
-                const double top = c00 + (c01 - c00) * fx;
-                const double bot = c10 + (c11 - c10) * fx;
-                double v = top + (bot - top) * fy;
-                if (v < 0) v = 0;
-                if (v > 255) v = 255;
-                result |= ((UINT32)(v + 0.5) & 0xFF) << shift;
-            }
-            out[x] = result;
+/* NV12 (BT.709, limited range, as phone encoders produce) → BGRA with
+ * aspect-preserving nearest-neighbour scaling, for apps that insist on RGB. */
+static void Nv12ToRgb32(const BYTE* src, UINT sw, UINT sh, BYTE* dst, UINT dw, UINT dh, bool bottomUp) {
+    const Fit f = FitInside(sw, sh, dw, dh);
+    memset(dst, 0, (size_t)dw * dh * 4);
+    const BYTE* suv = src + (size_t)sw * sh;
+    for (UINT y = 0; y < f.oh; ++y) {
+        const UINT sy = (UINT)((UINT64)y * sh / f.oh);
+        const BYTE* yrow = src + (size_t)sy * sw;
+        const BYTE* uvrow = suv + (size_t)(sy / 2) * sw;
+        const UINT dy = bottomUp ? dh - 1 - (y + f.oy) : y + f.oy;
+        UINT32* out = (UINT32*)(dst + (size_t)dy * dw * 4) + f.ox;
+        for (UINT x = 0; x < f.ow; ++x) {
+            const UINT sx = (UINT)((UINT64)x * sw / f.ow);
+            const int c = (yrow[sx] - 16) * 298;
+            const int d = uvrow[sx & ~1u] - 128;
+            const int e = uvrow[(sx & ~1u) + 1] - 128;
+            const BYTE r = Clamp255((c + 459 * e + 128) >> 8);
+            const BYTE g = Clamp255((c - 55 * d - 136 * e + 128) >> 8);
+            const BYTE b = Clamp255((c + 541 * d + 128) >> 8);
+            out[x] = 0xFF000000u | ((UINT32)r << 16) | ((UINT32)g << 8) | b;
         }
     }
 }
@@ -318,8 +370,10 @@ class PhoneCamPin : public IPin, public IAMStreamConfig, public IKsPropertySet {
 
     bool OpenSharedMemory();
     void CloseSharedMemory();
-    /* Copies the newest frame into dst, letterboxed. False if nothing to show. */
-    bool CopyLatestFrame(BYTE* dst, UINT dstStride, UINT dstW, UINT dstH);
+    /* Copies the newest frame into dst, fitted to the negotiated format. False
+     * if there is nothing to show. */
+    bool CopyLatestFrame(BYTE* dst, UINT32* index, INT64* ptsUs, UINT* fps);
+    REFERENCE_TIME StreamTime();
 
     LONG m_ref;
     PhoneCamFilter* m_pFilter;
@@ -330,9 +384,9 @@ class PhoneCamPin : public IPin, public IAMStreamConfig, public IKsPropertySet {
     IMemAllocator* m_pAllocator;
     AM_MEDIA_TYPE m_mt; /* connection type; only valid while connected */
 
-    UINT m_width, m_height, m_stride;
+    UINT m_width, m_height, m_fps;
+    bool m_nv12;
     bool m_bottomUp;
-    UINT m_srcWidth, m_srcHeight, m_srcStride;
 
     HANDLE m_hMap;
     BYTE* m_pView;
@@ -342,7 +396,18 @@ class PhoneCamPin : public IPin, public IAMStreamConfig, public IKsPropertySet {
 
     HANDLE m_hThread;
     HANDLE m_hStop;
-    REFERENCE_TIME m_rtNext;
+
+    /* Timestamps: phone capture times mapped onto stream time, so frames that
+     * arrive unevenly over Wi-Fi still carry evenly spaced timestamps. */
+    UINT32 m_lastIndex;
+    bool m_haveBase;
+    REFERENCE_TIME m_rtBase;
+    INT64 m_ptsBase;
+    REFERENCE_TIME m_rtLast;
+    LARGE_INTEGER m_qpcStart;
+
+  public:
+    REFERENCE_TIME m_tStart; /* from IMediaFilter::Run */
 };
 
 /* ------------------------------------------------------------------ */
@@ -377,6 +442,8 @@ class PhoneCamFilter : public IBaseFilter {
     STDMETHODIMP QueryVendorInfo(LPWSTR* pVendorInfo);
 
     PhoneCamPin* Pin() const { return m_pPin; }
+    IReferenceClock* Clock() const { return m_pClock; }
+    FILTER_STATE State() const { return m_state; }
 
   private:
     LONG m_ref;
@@ -492,7 +559,7 @@ STDMETHODIMP EnumMediaTypes::Next(ULONG cTypes, AM_MEDIA_TYPE** ppTypes,
         AM_MEDIA_TYPE* pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
         if (!pmt) break;
         ZeroMemory(pmt, sizeof(AM_MEDIA_TYPE));
-        FillVideoInfoHeader(pmt, kCaps[m_pos].w, kCaps[m_pos].h);
+        FillVideoInfoHeader(pmt, kCaps[m_pos].w, kCaps[m_pos].h, kCaps[m_pos].fps, kCaps[m_pos].nv12);
         if (!pmt->pbFormat) {
             CoTaskMemFree(pmt);
             break;
@@ -534,19 +601,23 @@ PhoneCamPin::PhoneCamPin(PhoneCamFilter* pFilter, HRESULT* phr)
       m_pDownstream(NULL),
       m_pDownstreamInput(NULL),
       m_pAllocator(NULL),
-      m_width(kDefaultWidth),
-      m_height(kDefaultHeight),
-      m_stride(kDefaultWidth * 4),
+      m_width(kCaps[0].w),
+      m_height(kCaps[0].h),
+      m_fps(kCaps[0].fps),
+      m_nv12(kCaps[0].nv12),
       m_bottomUp(false),
-      m_srcWidth(0),
-      m_srcHeight(0),
-      m_srcStride(0),
       m_hMap(NULL),
       m_pView(NULL),
       m_lastOpenTry(0),
       m_hThread(NULL),
       m_hStop(NULL),
-      m_rtNext(0) {
+      m_lastIndex(0),
+      m_haveBase(false),
+      m_rtBase(0),
+      m_ptsBase(0),
+      m_rtLast(0),
+      m_tStart(0) {
+    m_qpcStart.QuadPart = 0;
     ZeroMemory(&m_mt, sizeof(m_mt));
     m_hStop = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!m_hStop && phr) *phr = E_FAIL;
@@ -600,14 +671,14 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
         memcpy(chosen.pbFormat, pmt->pbFormat, pmt->cbFormat);
         if (chosen.pUnk) chosen.pUnk->AddRef();
     } else {
-        FillVideoInfoHeader(&chosen, m_width, m_height);
+        FillVideoInfoHeader(&chosen, m_width, m_height, m_fps, m_nv12);
         if (!chosen.pbFormat) return E_OUTOFMEMORY;
     }
 
     VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)chosen.pbFormat;
-    const UINT w = (UINT)vih->bmiHeader.biWidth;
-    const UINT h = (UINT)abs(vih->bmiHeader.biHeight);
-    if (w == 0 || h == 0 || w > PHONECAM_MAX_WIDTH || h > PHONECAM_MAX_HEIGHT) {
+    UINT w = 0, h = 0, fps = 30;
+    bool nv12 = true;
+    if (!ParseFormat(&chosen, &w, &h, &fps, &nv12)) {
         FreeMediaTypeContents(&chosen);
         return VFW_E_TYPE_NOT_ACCEPTED;
     }
@@ -621,7 +692,7 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
 
     ALLOCATOR_PROPERTIES props, actual;
     props.cBuffers = 3;
-    props.cbBuffer = (long)(w * h * 4);
+    props.cbBuffer = (long)FrameBytes(w, h, nv12);
     props.cbAlign = 1;
     props.cbPrefix = 0;
     hr = m_pAllocator->SetProperties(&props, &actual);
@@ -666,11 +737,12 @@ STDMETHODIMP PhoneCamPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) {
 
     FreeMediaTypeContents(&m_mt);
     m_mt = chosen;
-    m_bottomUp = vih->bmiHeader.biHeight > 0;
+    m_bottomUp = !nv12 && vih->bmiHeader.biHeight > 0;
 
     m_width = w;
     m_height = h;
-    m_stride = w * 4;
+    m_fps = fps;
+    m_nv12 = nv12;
     m_pDownstream = pReceivePin;
     m_pDownstream->AddRef();
     return S_OK;
@@ -752,14 +824,7 @@ STDMETHODIMP PhoneCamPin::QueryId(LPWSTR* Id) {
 }
 
 STDMETHODIMP PhoneCamPin::QueryAccept(const AM_MEDIA_TYPE* pmt) {
-    if (!IsAcceptableFormat(pmt)) return S_FALSE;
-    const VIDEOINFOHEADER* vih = (const VIDEOINFOHEADER*)pmt->pbFormat;
-    const UINT w = (UINT)vih->bmiHeader.biWidth;
-    const UINT h = (UINT)abs(vih->bmiHeader.biHeight);
-    if (w == 0 || h == 0 || w > PHONECAM_MAX_WIDTH || h > PHONECAM_MAX_HEIGHT) {
-        return S_FALSE;
-    }
-    return S_OK;
+    return IsAcceptableFormat(pmt) ? S_OK : S_FALSE;
 }
 
 STDMETHODIMP PhoneCamPin::EnumMediaTypes(IEnumMediaTypes** ppEnum) {
@@ -797,15 +862,7 @@ STDMETHODIMP PhoneCamPin::SetFormat(AM_MEDIA_TYPE* pmt) {
     if (!IsAcceptableFormat(pmt)) return VFW_E_TYPE_NOT_ACCEPTED;
     if (m_pDownstream) return VFW_E_ALREADY_CONNECTED; /* must be set before Connect */
 
-    const VIDEOINFOHEADER* vih = (const VIDEOINFOHEADER*)pmt->pbFormat;
-    const UINT w = (UINT)vih->bmiHeader.biWidth;
-    const UINT h = (UINT)abs(vih->bmiHeader.biHeight);
-    if (w == 0 || h == 0 || w > PHONECAM_MAX_WIDTH || h > PHONECAM_MAX_HEIGHT) {
-        return VFW_E_TYPE_NOT_ACCEPTED;
-    }
-    m_width = w;
-    m_height = h;
-    m_stride = w * 4;
+    ParseFormat(pmt, &m_width, &m_height, &m_fps, &m_nv12);
     return S_OK;
 }
 
@@ -814,7 +871,7 @@ STDMETHODIMP PhoneCamPin::GetFormat(AM_MEDIA_TYPE** ppmt) {
     AM_MEDIA_TYPE* pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
     if (!pmt) return E_OUTOFMEMORY;
     ZeroMemory(pmt, sizeof(*pmt));
-    FillVideoInfoHeader(pmt, m_width, m_height);
+    FillVideoInfoHeader(pmt, m_width, m_height, m_fps, m_nv12);
     if (!pmt->pbFormat) {
         CoTaskMemFree(pmt);
         return E_OUTOFMEMORY;
@@ -840,7 +897,8 @@ STDMETHODIMP PhoneCamPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt,
     AM_MEDIA_TYPE* pmt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
     if (!pmt) return E_OUTOFMEMORY;
     ZeroMemory(pmt, sizeof(*pmt));
-    FillVideoInfoHeader(pmt, kCaps[iIndex].w, kCaps[iIndex].h);
+    const Cap& cap = kCaps[iIndex];
+    FillVideoInfoHeader(pmt, cap.w, cap.h, cap.fps, cap.nv12);
     if (!pmt->pbFormat) {
         CoTaskMemFree(pmt);
         *ppmt = NULL;
@@ -866,10 +924,10 @@ STDMETHODIMP PhoneCamPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt,
     caps->MaxOutputSize.cy = kCaps[iIndex].h;
     caps->OutputGranularityX = 1;
     caps->OutputGranularityY = 1;
-    caps->MinFrameInterval = 10000000LL / kFps;
-    caps->MaxFrameInterval = 10000000LL / kFps;
-    caps->MinBitsPerSecond = (LONG)(kCaps[iIndex].w * kCaps[iIndex].h * 4 * 8 * kFps / 4);
-    caps->MaxBitsPerSecond = (LONG)(kCaps[iIndex].w * kCaps[iIndex].h * 4 * 8 * kFps);
+    caps->MinFrameInterval = 10000000LL / cap.fps;
+    caps->MaxFrameInterval = 10000000LL / cap.fps;
+    caps->MinBitsPerSecond = (LONG)((UINT64)FrameBytes(cap.w, cap.h, cap.nv12) * 8 * cap.fps / 4);
+    caps->MaxBitsPerSecond = (LONG)((UINT64)FrameBytes(cap.w, cap.h, cap.nv12) * 8 * cap.fps);
     return S_OK;
 }
 
@@ -910,7 +968,7 @@ bool PhoneCamPin::OpenSharedMemory() {
     if (m_pView) return true;
     m_hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, PHONECAM_SHM_NAME);
     if (!m_hMap) return false;
-    m_pView = (BYTE*)MapViewOfFile(m_hMap, FILE_MAP_READ, 0, 0, PHONECAM_SHM_SIZE);
+    m_pView = (BYTE*)MapViewOfFile(m_hMap, FILE_MAP_READ, 0, 0, (SIZE_T)PHONECAM_SHM_SIZE);
     if (!m_pView) {
         CloseHandle(m_hMap);
         m_hMap = NULL;
@@ -928,38 +986,41 @@ void PhoneCamPin::CloseSharedMemory() {
         CloseHandle(m_hMap);
         m_hMap = NULL;
     }
-    m_srcWidth = m_srcHeight = m_srcStride = 0;
 }
 
-bool PhoneCamPin::CopyLatestFrame(BYTE* dst, UINT dstStride, UINT dstW, UINT dstH) {
+bool PhoneCamPin::CopyLatestFrame(BYTE* dst, UINT32* index, INT64* ptsUs, UINT* fps) {
     if (!m_pView) return false;
     const PhoneCamHeader* hdr = (const PhoneCamHeader*)m_pView;
-    if (hdr->magic != PHONECAM_MAGIC) return false;
-    if (hdr->version != PHONECAM_VERSION) return false;
-    if (hdr->format != PHONECAM_FMT_BGRA) return false;
+    if (hdr->magic != PHONECAM_MAGIC || hdr->version != PHONECAM_VERSION || hdr->format != PHONECAM_FMT_NV12) return false;
 
-    // The producer can disappear while readers keep the mapping alive.
-    // A monotonic heartbeat avoids displaying a frozen face indefinitely.
     for (int attempt = 0; attempt < 4; ++attempt) {
         const UINT32 before = hdr->frameIndex;
         if (!before) return false;
-        if (before & 1u) continue;
+        if (before & 1u) {
+            YieldProcessor();
+            continue;
+        }
         MemoryBarrier();
-        const UINT w = hdr->width, h = hdr->height, s = hdr->stride;
+        const UINT w = hdr->width, h = hdr->height, stride = hdr->stride;
         const UINT32 which = hdr->activeBuffer;
-        if (!w || !h || w > PHONECAM_MAX_WIDTH || h > PHONECAM_MAX_HEIGHT ||
-            s < w * 4 || (UINT64)s * h > PHONECAM_BUF_BYTES || which >= PHONECAM_BUFFERS) return false;
-        if ((DWORD)(GetTickCount() - hdr->reserved[0]) > 2500) return false;
+        if (!SizeOk(w, h) || stride != w || which >= PHONECAM_BUFFERS) return false;
+        /* The producer can disappear while readers keep the mapping alive; a
+         * heartbeat avoids showing a frozen face indefinitely. */
+        if ((DWORD)(GetTickCount() - hdr->heartbeat) > 2500) return false;
+        const INT64 pts = hdr->ptsUs;
+        const UINT srcFps = hdr->fps;
         const BYTE* src = m_pView + PHONECAM_BUF_OFFSET(which);
-        BlitScaled(dst, dstStride, dstW, dstH, src, w, h, s);
+        if (m_nv12) ScaleNv12(src, w, h, dst, m_width, m_height);
+        else Nv12ToRgb32(src, w, h, dst, m_width, m_height, m_bottomUp);
         MemoryBarrier();
         if (hdr->frameIndex == before) {
-            m_srcWidth = w; m_srcHeight = h; m_srcStride = s;
+            *index = before;
+            *ptsUs = pts;
+            *fps = srcFps ? srcFps : m_fps;
             return true;
         }
     }
-    return false; // Never publish a copy known to have raced the producer.
-
+    return false; /* never publish a copy known to have raced the producer */
 }
 
 /* ------------------------------------------------------------------ */
@@ -971,7 +1032,10 @@ void PhoneCamPin::StartStreaming() {
     if (!m_pAllocator || !m_pDownstreamInput) return;
     m_pAllocator->Commit();
     ResetEvent(m_hStop);
-    m_rtNext = 0;
+    m_lastIndex = 0;
+    m_haveBase = false;
+    m_rtLast = -1;
+    QueryPerformanceCounter(&m_qpcStart);
     m_hThread = CreateThread(NULL, 0, &PhoneCamPin::ThreadEntry, this, 0, NULL);
 }
 
@@ -993,59 +1057,94 @@ DWORD WINAPI PhoneCamPin::ThreadEntry(LPVOID param) {
     return 0;
 }
 
+/* Current stream time: graph clock relative to Run() when running, else a
+ * private monotonic clock. */
+REFERENCE_TIME PhoneCamPin::StreamTime() {
+    IReferenceClock* clock = m_pFilter->Clock();
+    REFERENCE_TIME now = 0;
+    if (clock && m_pFilter->State() == State_Running && SUCCEEDED(clock->GetTime(&now))) return now - m_tStart;
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (REFERENCE_TIME)((c.QuadPart - m_qpcStart.QuadPart) * 10000000.0 / f.QuadPart);
+}
+
+/* Frames are delivered as soon as the producer publishes them, not on a timer
+ * of our own: a fixed 30 Hz clock beating against the phone's own clock is
+ * what used to duplicate and drop frames in a regular pattern. A 1 ms
+ * high-resolution timer keeps the check cheap. */
 void PhoneCamPin::StreamLoop() {
-    LARGE_INTEGER frequency, start;
-    QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&start);
-    UINT64 frame = 0;
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+    HANDLE handles[2] = {m_hStop, timer};
+    DWORD lastDelivery = GetTickCount();
     for (;;) {
+        LARGE_INTEGER due;
+        due.QuadPart = -10000; /* 1 ms */
+        SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+        if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0) break;
+
+        if (!m_pView) {
+            const DWORD now = GetTickCount();
+            if (now - m_lastOpenTry >= 1000) {
+                m_lastOpenTry = now;
+                OpenSharedMemory();
+            }
+        }
+        const PhoneCamHeader* hdr = m_pView ? (const PhoneCamHeader*)m_pView : NULL;
+        const UINT32 index = hdr ? hdr->frameIndex : 0;
+        const bool fresh = index != 0 && !(index & 1u) && index != m_lastIndex;
+        /* Without new frames, keep the app alive with a slow trickle of the
+         * "no signal" picture instead of going silent. */
+        if (!fresh && GetTickCount() - lastDelivery < 200) continue;
         DeliverOneFrame();
-        ++frame;
-        LARGE_INTEGER now; QueryPerformanceCounter(&now);
-        const LONGLONG due = start.QuadPart + frame * frequency.QuadPart / kFps;
-        const DWORD wait = due > now.QuadPart ? (DWORD)((due - now.QuadPart) * 1000 / frequency.QuadPart) : 0;
-        if (WaitForSingleObject(m_hStop, wait) != WAIT_TIMEOUT) break;
-        if (now.QuadPart > due + frequency.QuadPart) { start = now; frame = 0; }
+        lastDelivery = GetTickCount();
     }
+    CloseHandle(timer);
 }
 
 void PhoneCamPin::DeliverOneFrame() {
     if (!m_pAllocator || !m_pDownstreamInput) return;
-
-    /* The server may start after us, or restart, so keep retrying — but a
-     * failed OpenFileMappingW is a syscall and 30 of them a second buys
-     * nothing that 1 a second does not. */
-    if (!m_pView) {
-        const DWORD now = GetTickCount();
-        if (now - m_lastOpenTry >= 1000) {
-            m_lastOpenTry = now;
-            OpenSharedMemory();
-        }
-    }
 
     IMediaSample* pSample = NULL;
     if (FAILED(m_pAllocator->GetBuffer(&pSample, NULL, NULL, 0))) return;
 
     BYTE* dst = NULL;
     if (SUCCEEDED(pSample->GetPointer(&dst))) {
-        /* With no mapping there is nothing to copy — but a frame still has to
-         * go downstream. An app handed no frames at all sits on a black
-         * preview and looks hung, which is a worse answer than "no signal". */
-        if (!m_pView || !CopyLatestFrame(dst, m_stride, m_width, m_height)) {
-            FillNoSignal(dst, m_stride, m_width, m_height);
+        UINT32 index = 0;
+        INT64 pts = 0;
+        UINT fps = m_fps;
+        const bool live = CopyLatestFrame(dst, &index, &pts, &fps);
+        if (!live) {
+            /* An app handed no frames at all sits on a black preview and looks
+             * hung, which is a worse answer than "no signal". */
+            FillNoSignal(dst, m_width, m_height, m_nv12);
+            m_haveBase = false;
         }
-        if (m_bottomUp) {
-            for (UINT y = 0; y < m_height / 2; ++y) {
-                BYTE* top = dst + y * m_stride;
-                BYTE* bottom = dst + (m_height - 1 - y) * m_stride;
-                for (UINT x = 0; x < m_stride; ++x) { const BYTE p = top[x]; top[x] = bottom[x]; bottom[x] = p; }
+        m_lastIndex = live ? index : 0;
+
+        const REFERENCE_TIME now = StreamTime();
+        REFERENCE_TIME start = now;
+        if (live) {
+            REFERENCE_TIME mapped = m_rtBase + (pts - m_ptsBase) * 10;
+            /* Rebase when the phone clock and ours drift apart, after a gap, or
+             * when the phone restarts its stream. */
+            if (!m_haveBase || mapped < now - 1500000 || mapped > now + 500000) {
+                m_haveBase = true;
+                m_rtBase = now;
+                m_ptsBase = pts;
+                mapped = now;
             }
+            start = mapped;
         }
-        pSample->SetActualDataLength((long)(m_stride * m_height));
+        if (start <= m_rtLast) start = m_rtLast + 1;
+        m_rtLast = start;
+        REFERENCE_TIME stop = start + 10000000LL / (fps ? fps : 30);
+
+        pSample->SetActualDataLength((long)FrameBytes(m_width, m_height, m_nv12));
         pSample->SetSyncPoint(TRUE);
         pSample->SetPreroll(FALSE);
-        REFERENCE_TIME stop = m_rtNext + 10000000LL / kFps;
-        pSample->SetTime(&m_rtNext, &stop);
-        m_rtNext = stop;
+        pSample->SetTime(&start, &stop);
         m_pDownstreamInput->Receive(pSample);
     }
     pSample->Release();
@@ -1111,8 +1210,10 @@ STDMETHODIMP PhoneCamFilter::Pause() {
 }
 
 STDMETHODIMP PhoneCamFilter::Run(REFERENCE_TIME tStart) {
-    (void)tStart;
-    if (m_pPin) m_pPin->StartStreaming();
+    if (m_pPin) {
+        m_pPin->m_tStart = tStart;
+        m_pPin->StartStreaming();
+    }
     m_state = State_Running;
     return S_OK;
 }
