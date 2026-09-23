@@ -5,6 +5,14 @@ edition = "2021"
 description = "Receives the phone camera stream and feeds the PhoneCam virtual webcam"
 publish = false
 
+[lib]
+name = "phonecam_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phonecam-server"
+path = "src/main.rs"
+
 [dependencies]
 # Windows-only on purpose: Media Foundation decoding and the shared memory
 # handoff to the DirectShow filter are the whole job.

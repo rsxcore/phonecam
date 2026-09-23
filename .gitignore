@@ -16,3 +16,5 @@ __pycache__/
 *.pyc
 *.apk
 PhoneCam — готово/
+node_modules/
+desktop/src-tauri/gen/

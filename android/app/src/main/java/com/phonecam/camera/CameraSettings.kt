@@ -19,7 +19,7 @@ data class CameraSettings(
     val lensId: String = "",                          // restart
     val width: Int = 1920,                            // restart
     val height: Int = 1080,                           // restart
-    val fps: Int = 30,                                // restart
+    val fps: Int = 30,                                // restart; 60 heats the phone, so opt-in
     val codec: Codec = Codec.H264,                    // restart
     val bitrate: Int = 20_000_000,
     val manualExposure: Boolean = false,

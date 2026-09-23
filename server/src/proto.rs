@@ -181,6 +181,10 @@ impl Connection {
         let mut chunk = [0u8; 64 * 1024];
         while self.buf.len() < n {
             while let Ok((kind, payload)) = self.outbox.try_recv() {
+                if kind == 0xFF {
+                    // Local request to drop this connection (see engine::DISCONNECT).
+                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Switching phone"));
+                }
                 self.write_now(kind, &payload)?;
             }
             match self.tls.reader().read(&mut chunk) {

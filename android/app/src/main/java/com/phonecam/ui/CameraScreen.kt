@@ -108,6 +108,14 @@ fun CameraScreen(
                 Spacer(Modifier.weight(1f))
                 RoundIcon(Icons.Rounded.Tune, "Settings", iconRotation) { settingsOpen = true }
             }
+            if (state.thermal >= android.os.PowerManager.THERMAL_STATUS_MODERATE || state.throttled) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    if (state.throttled) "Phone got hot: switched to 1080p30 to keep streaming"
+                    else "Phone is getting warm. Remove the case or lower the frame rate.",
+                    style = MaterialTheme.typography.labelMedium, color = Palette.Waiting,
+                )
+            }
             if (state.phase == Phase.STREAMING || state.phase == Phase.WAITING) {
                 Spacer(Modifier.height(8.dp))
                 Text(

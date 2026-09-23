@@ -40,6 +40,10 @@ data class UiState(
     val dropped: Long = 0,
     val encoder: String = "",
     val pairing: com.phonecam.net.PairRequest? = null,
+    /** PowerManager.THERMAL_STATUS_*; 0 = cool. */
+    val thermal: Int = 0,
+    /** Set when PhoneCam lowered the quality by itself to cool the phone down. */
+    val throttled: Boolean = false,
 )
 
 /**
@@ -67,6 +71,10 @@ object Streamer {
     @Volatile private var deviceDegrees = 0
     @Volatile private var lastLandscape = 90
     @Volatile private var rotation = 0
+
+    private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
+    private var recoveries = 0
+    private var lastHealthyAt = 0L
 
     private var lastSentFrames = 0L
     private var lastSentBytes = 0L
@@ -98,8 +106,9 @@ object Streamer {
                 )
                 s.start()
                 server = s
-                engine = CameraEngine(ctx, h, onLive = { live -> _state.update { it.copy(live = live) } }, onError = ::fail)
+                engine = CameraEngine(ctx, h, onLive = { live -> _state.update { it.copy(live = live) } }, onError = ::cameraFailed)
                 startOrientation(ctx)
+                startThermal(ctx)
                 openPipeline()
                 _state.update { it.copy(phase = phaseFor(it.pc)) }
                 h.postDelayed(::tick, 1000)
@@ -115,6 +124,8 @@ object Streamer {
         val done = CountDownLatch(1)
         h.post {
             orientation?.disable(); orientation = null
+            thermalListener?.let { appContext?.getSystemService(android.os.PowerManager::class.java)?.removeThermalStatusListener(it) }
+            thermalListener = null
             engine?.close(); engine = null
             relay?.release(); relay = null
             encoder?.release(); encoder = null
@@ -143,7 +154,7 @@ object Streamer {
             val current = _state.value.settings
             val next = change(current).sanitized(_state.value.lenses)
             if (next == current) return@post
-            _state.update { it.copy(settings = next) }
+            _state.update { it.copy(settings = next, throttled = it.throttled && !next.needsRestart(current)) }
             appContext?.let { CameraSettings.save(it, next) }
             updateRotation()
             if (next.needsRestart(current)) {
@@ -224,6 +235,7 @@ object Streamer {
                 }
             }
             lastSentFrames = frames; lastSentBytes = bytes; lastStatsAt = now
+            if (_state.value.phase != Phase.ERROR && _state.value.live.fps > 0) lastHealthyAt = now
             s.sendState(stateJson())
         }
         h.postDelayed(::tick, 1000)
@@ -232,6 +244,49 @@ object Streamer {
     private fun fail(message: String) {
         Log.e(TAG, message)
         _state.update { it.copy(phase = Phase.ERROR, error = message) }
+    }
+
+    /**
+     * The camera HAL can drop the device at any time (overheating, another app
+     * taking the camera). Reopen it after a pause instead of leaving the PC
+     * with a frozen stream; after overheating, only once the phone has cooled.
+     */
+    private fun cameraFailed(message: String) {
+        fail(message)
+        val h = handler ?: return
+        if (System.nanoTime() - lastHealthyAt > 60_000_000_000L) recoveries = 0
+        if (recoveries >= 5) return
+        recoveries++
+        val hot = _state.value.thermal >= android.os.PowerManager.THERMAL_STATUS_SEVERE
+        if (hot) coolDown(reopen = false)
+        h.postDelayed({ if (handler != null && _state.value.phase == Phase.ERROR) openPipeline() }, if (hot) 15_000L else 2_000L)
+    }
+
+    /** Steps down to the cheapest good-looking mode: 1080p30, manual controls intact. */
+    private fun coolDown(reopen: Boolean = true) {
+        val st = _state.value
+        val lens = st.lenses.firstOrNull { it.id == st.settings.lensId } ?: return
+        val mode = lens.modes.firstOrNull { it.width == st.settings.width && it.height == st.settings.height && it.fps == st.settings.fps }
+        if (mode == null || (!mode.highSpeed && mode.height <= 1080 && mode.fps <= 30)) return
+        val safe = lens.modes.firstOrNull { it.height == 1080 && it.fps == 30 } ?: lens.modes.last()
+        Log.w(TAG, "Phone is hot: switching ${mode.label} -> ${safe.label}")
+        val next = st.settings.copy(width = safe.width, height = safe.height, fps = safe.fps)
+        _state.update { it.copy(settings = next, throttled = true) }
+        if (reopen) openPipeline()
+        server?.sendState(stateJson())
+    }
+
+    private fun startThermal(ctx: Context) {
+        val power = ctx.getSystemService(android.os.PowerManager::class.java) ?: return
+        val listener = android.os.PowerManager.OnThermalStatusChangedListener { status ->
+            handler?.post {
+                _state.update { it.copy(thermal = status) }
+                if (status >= android.os.PowerManager.THERMAL_STATUS_SEVERE) coolDown()
+                server?.sendState(stateJson())
+            }
+        }
+        power.addThermalStatusListener(ctx.mainExecutor, listener)
+        thermalListener = listener
     }
 
     private fun phaseFor(pc: String?) = when {
@@ -282,6 +337,8 @@ object Streamer {
                 .put("focusDiopters", st.live.focusDiopters.toDouble()).put("cameraFps", st.live.fps.toDouble()))
             .put("sentFps", st.sentFps.toDouble()).put("kbps", st.kbps).put("dropped", st.dropped)
             .put("encoder", st.encoder)
+            .put("thermal", st.thermal).put("throttled", st.throttled)
+            .put("error", st.error ?: JSONObject.NULL)
     }
 
     private fun logCapabilities(lenses: List<Lens>) {

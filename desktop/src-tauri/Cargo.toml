@@ -1,0 +1,25 @@
+[package]
+name = "phonecam"
+version = "2.0.0"
+description = "PhoneCam desktop app: your phone as a webcam"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+phonecam-server = { path = "../../server" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ring = "0.17"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
