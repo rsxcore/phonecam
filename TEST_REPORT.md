@@ -1,57 +1,58 @@
-# 🧪 Test Report — PhoneCam 1.1
+# 🧪 Test Report: PhoneCam 2.0
 
 [← Back to README](README.md)
 
-**Date:** September 21, 2026  **Environment:** Windows 11 x64 (build machine)
+**Date:** September 23, 2026
+**Phone:** Nothing Phone (1) (A063), Snapdragon 778G+, Android 15
+**PC:** Windows 11 x64, NVIDIA GPU
 
-Every check below was actually run. Physical-phone results are **not** presented as confirmed.
+All results below were measured on this real hardware.
 
-## Results
+## Stream quality
 
 | Check | Result |
 |:--|:--|
-| Rust release build, Clippy `-D warnings` | ✅ Pass |
-| Rust unit tests | ✅ 6 / 6 |
-| C++ virtual camera and Win32 EXE | ✅ Release build, static CRT |
-| COM lifetime / format native test | ✅ 1000 cycles, no errors |
-| Android release with R8 and resource shrinking | ✅ Pass |
-| Android JVM tests | ✅ 6 / 6, including real HTTP/UDP and port reuse on restart |
-| Android lint (release) | ✅ 0 errors; remaining warnings are about newer versions and style preferences |
-| APK | ✅ v2 signature verified by `apksigner`; package `com.phonecam`, version 1.1 (2), minSdk 24, targetSdk 36 |
-| Virtual device registration | ✅ PhoneCam enumerated by ffmpeg DirectShow, HKCU registration |
-| Moving test signal and window | ✅ Start from the button and live preview verified |
-| Network JPEG → DirectShow | ✅ 60 frames in 2 seconds, correct colors |
-| Rotation | ✅ 0°, 90°, 180°, 270° — image corner checks pass |
-| Aspect ratio | ✅ Portrait letterbox and 640×480 output verified |
-| Second writer | ✅ Rejected, first stream unaffected |
-| Receiver stop | ✅ Stale frame replaced with a "no signal" fill |
-| Restart while shared memory is held | ✅ Pass |
-| Hang / disconnect / invalid JPEG length | ✅ Auto-recovery, bad frames never output |
-| Continuous graph, 90 seconds | ✅ 2700 frames, 0 tears detected |
-| Receiver restart within the same graph | ✅ Pass, capture not recreated |
-| Network drop within the same graph | ✅ Pass, capture not recreated |
+| 1080p30 H.264, USB | ✅ 30.01 fps, frame intervals 33.3 ms, 20 Mbps |
+| 1080p60 (120 fps sensor, every 2nd frame kept) | ✅ 60.00 fps, every interval exactly 16.7 ms, 0 skips in 10 s |
+| 1080p60 over Wi-Fi with TLS, 22 s | ✅ 58.3–61.3 fps per second (avg 59.9), 0 congestion drops |
+| PC decoding, Media Foundation on the GPU | ✅ ~2.5 ms decode, ~5–6 ms including rotation and publish (software decode was ~10 ms) |
+| DirectShow capture (ffmpeg as the client) at 1920×1080 NV12 60 fps | ✅ 480 frames in 8 s (59.88 fps), timestamps in 16.7 ms steps |
+| Desktop app live preview (WebCodecs) | ✅ 29–30 fps at 1080p30, including after reconnects and lens switches |
 
-### About the soak test
+## Connection & security
 
-In the 90-second test the source alternated between 16 solid-color 1280×720 JPEGs. The check compared colors across the whole frame after DirectShow capture; a mix of parts from different frames would be detected as a tear. This is a targeted synchronization test, not proof that no video defect of any kind can occur.
+| Check | Result |
+|:--|:--|
+| TLS 1.3 handshake with certificates on both sides | ✅ |
+| First pairing: same code on phone and PC, approval on phone | ✅ |
+| Reconnect after pairing: no prompt, no code | ✅ |
+| Discovery over Wi-Fi (subnet broadcast) | ✅ |
+| Fallback to last known address (USB forward) | ✅ |
 
-### Performance
+## Robustness
 
-Last receiver reading during the long test: **30.1 incoming fps; 3.3 ms decode + frame preparation.**
+| Check | Result |
+|:--|:--|
+| Camera taken by another app, then released | ✅ Reopened automatically after 2 s |
+| Camera HAL thermal shutdown (observed after ~35 min at 60 fps while charging) | ✅ Root cause found; protection added (see below) |
+| Preview after reconnect / lens change | ✅ Fixed (it used to stay black) |
+| Front camera orientation | ✅ Fixed (was upside down); rotation derived from the camera's own transform |
+| Rotating the phone in Auto mode | ✅ Confirmed by the user in all positions |
+| OBS running as administrator | ✅ Root cause found (per-user registration invisible to elevated apps); one-click system registration added and used |
 
-> [!WARNING]
-> This is a synthetic JPEG on localhost on one specific PC. Camera time, JPEG encoding on the phone, Wi-Fi and the calling app's rendering are not included. These 3.3 ms must not be called end-to-end latency.
+## Automated tests
 
-The full build and core checks are reproducible with `build.ps1 -Test`. Integration tests live in `tests/`. The last Win32 change after the network tests touched only restoring the window from the tray, with no changes to the receiver or the DLL.
+| Suite | Result |
+|:--|:--|
+| Rust (`phonecam_core`) | ✅ 8 / 8 |
+| Android JVM (rotation) | ✅ 4 / 4 |
+| Native filter (COM lifetime ×1000, formats, pixels) | ✅ Pass |
+| Svelte type check | ✅ 0 errors |
 
-## ❌ Not tested
+## ❌ Not verified yet
 
-- Physical Android camera — `adb` found no connected devices
-- Behavior on a specific phone with the screen off, OEM restrictions, temperature and battery drain
-- Real end-to-end latency and stability on the user's home Wi-Fi
-- Real USB forwarding with a phone
-- Each specific calling app, Windows Camera / Media Foundation-only apps
-- Hardware H.264, microphone and x86 — not part of this implementation
-
-> [!NOTE]
-> During later UI testing, a Windows Firewall prompt appeared for the Java runtime used by the local JVM tests; security settings were not changed. Therefore the final mouse-driven discover / enter-code flow is not claimed as fully verified — its network components were tested separately by automated tests. The test button and window preview were verified visually earlier.
+- Automatic step-down to 1080p30 at thermal status SEVERE: the code path is in place, but it was not triggered on purpose.
+- HEVC end to end in OBS.
+- Streaming for hours at 1080p30.
+- Other phone models: the rotation logic reads the framework transform to stay portable, but only one phone was tested.
+- The minified release APK: it builds (2 MB), but was not run on the phone yet.

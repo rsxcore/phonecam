@@ -1,13 +1,16 @@
-# 🤝 Project Handoff — PhoneCam 1.1
+# 🤝 Project Handoff: PhoneCam 2.0
 
 [← Back to README](README.md)
 
 **Start here:** [README.md](README.md), [DEVELOPMENT.md](DEVELOPMENT.md) and [TEST_REPORT.md](TEST_REPORT.md).
-The original version of the project is preserved in Git commit `f8a68ba`.
 
-## What changed in 1.1
+## What 2.0 changed
 
-Previously, the Windows server only drew test bars, Android read a single Y plane as if it were a full NV21 frame, and the COM filter had memory-ownership and lifetime bugs. These parts are fixed. Added: a real network receiver, a Win32 client that bundles all components, a release APK, tests and documentation.
+Version 1.1 streamed software-encoded MJPEG at 720p30 with a six-digit code per session. 2.0 rebuilt every part:
+
+- **Phone:** Camera2 with manual controls, a GPU relay and hardware H.264/HEVC. The new Compose UI adds thermal protection and camera recovery.
+- **Network:** protocol v2 over TLS 1.3 with one-time pairing and automatic discovery.
+- **PC:** a Rust engine with GPU decoding, an NV12 DirectShow filter up to 4K, and a Tauri desktop app.
 
 ## Essentials
 
@@ -15,6 +18,7 @@ Previously, the Windows server only drew test bars, Android read a single Y plan
 |:--|:--|
 | Build | `pwsh -File build.ps1 -Test` |
 | Never modify or publish | `android/phonecam-release.jks`, `android/signing.properties` |
+| Quick phone iteration | `work/deploy.sh` (build, install over USB, relaunch, forward port) |
 
-> [!IMPORTANT]
-> **Honest limitation:** no physical Android device was connected. CameraX and power consumption on a real phone are untested; passing JVM tests and a successful build do not prove them. Transport is still MJPEG, not H.264; there is no microphone.
+> [!NOTE]
+> Tested on one phone (Nothing Phone (1)). See the "Not verified yet" list in [TEST_REPORT.md](TEST_REPORT.md).
