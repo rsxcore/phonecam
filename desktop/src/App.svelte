@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Cable, Cpu, MonitorPlay, Settings2, ShieldCheck, Smartphone, TriangleAlert, Wifi, Zap } from "@lucide/svelte";
+  import { Cable, Cpu, MonitorPlay, RefreshCw, Settings2, ShieldCheck, Smartphone, TriangleAlert, Wifi, Zap } from "@lucide/svelte";
   import { onMount } from "svelte";
   import CameraPanel from "./lib/CameraPanel.svelte";
   import { engine } from "./lib/engine.svelte";
@@ -22,6 +22,38 @@
     }
   }
 
+  // Settings cover the main view, where approval and pairing are answered;
+  // both time out, so close Settings the moment one starts.
+  $effect(() => {
+    if (engine.approval || engine.phase === "pairing") settingsOpen = false;
+  });
+
+  let excluding = $state(false);
+
+  async function excludeRtss() {
+    excluding = true;
+    try {
+      await engine.excludeRtss();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      excluding = false;
+    }
+  }
+
+  let allowing = $state(false);
+
+  async function allowFirewall() {
+    allowing = true;
+    try {
+      await engine.allowFirewall();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      allowing = false;
+    }
+  }
+
   onMount(() => {
     engine.start();
   });
@@ -38,13 +70,13 @@
     <header class="topbar">
       <div class="brand">
         <img src={logo} alt="" />
-        <span>PhoneCam</span>
+        <span class="btn-label">PhoneCam</span>
       </div>
-      <div class="pill" class:live class:wait={engine.phase === "pairing"}>
+      <div class="pill" class:live class:wait={engine.phase === "pairing" || !!engine.approval}>
         <span class="dot"></span>
         {#if live}
           LIVE · {engine.device ?? "Phone"}
-        {:else if engine.phase === "pairing"}
+        {:else if engine.phase === "pairing" || engine.approval}
           Waiting for approval
         {:else if engine.phase === "connecting"}
           Connecting…
@@ -55,13 +87,34 @@
         {/if}
       </div>
       <div class="spacer"></div>
+      {#if engine.listening?.address}
+        <span class="pc-address" title="Type this in PhoneCam on the phone: Settings → Connect to PC">
+          <Smartphone size={14} /> <span class="wide-only">Phone connects to</span> <b>{engine.listening.address}</b>
+        </span>
+      {/if}
+      {#if live || engine.phase === "connecting"}
+        <button class="ghost" onclick={() => engine.reconnect()} title="Drop the connection and connect again">
+          <RefreshCw size={16} /> <span class="btn-label">Reconnect</span>
+        </button>
+      {/if}
       <button class="ghost" class:active={engine.testPattern} onclick={() => engine.toggleTestPattern()} title="Show colour bars in the virtual camera">
-        <MonitorPlay size={16} /> Test camera
+        <MonitorPlay size={16} /> <span class="btn-label">Test camera</span>
       </button>
       <button class="icon" onclick={() => (settingsOpen = true)} title="Settings"><Settings2 size={18} /></button>
     </header>
 
     <section class="viewer">
+      {#if engine.rtss}
+        <div class="notice">
+          <TriangleAlert size={15} />
+          <span>
+            <b>RivaTuner (MSI Afterburner overlay) is running.</b> Its overlay can crash this window and leave it black. <b>Fix</b> turns
+            the overlay off for <code>msedgewebview2.exe</code> (one administrator prompt), as RivaTuner's "Application detection level:
+            None" does. Restart RivaTuner afterwards. The virtual camera is not affected either way.
+          </span>
+          <button class="primary small-btn" disabled={excluding} onclick={excludeRtss}>{excluding ? "…" : "Fix"}</button>
+        </div>
+      {/if}
       <Preview active={live} />
       {#if live}
         <div class="overlay top">
@@ -82,7 +135,18 @@
         {/if}
       {:else}
         <div class="empty">
-          {#if engine.phase === "pairing"}
+          {#if engine.approval}
+            <div class="pair">
+              <div class="pair-icon"><ShieldCheck size={30} /></div>
+              <h2>Allow {engine.approval.name}?</h2>
+              <p>This phone connected from {engine.approval.address}. Allow it only if it is yours and shows the same code.</p>
+              <div class="code">{engine.approval.code.slice(0, 3)} {engine.approval.code.slice(3)}</div>
+              <div class="actions">
+                <button class="ghost" onclick={() => engine.approve(false)}>Deny</button>
+                <button class="primary" onclick={() => engine.approve(true)}>Allow</button>
+              </div>
+            </div>
+          {:else if engine.phase === "pairing"}
             <div class="pair">
               <div class="pair-icon"><ShieldCheck size={30} /></div>
               <h2>Confirm on your phone</h2>
@@ -108,6 +172,17 @@
               <li><span>2</span> Connect both to the same Wi-Fi, or plug in USB</li>
               <li><span>3</span> That's it: the camera connects by itself</li>
             </ol>
+            {#if engine.listening?.address}
+              <div class="dial">
+                <p>Phone on another network or router? In PhoneCam on the phone, connect to</p>
+                <div class="dial-address">{engine.listening.address}</div>
+                <button class="ghost small-btn" disabled={allowing} onclick={allowFirewall}>
+                  {allowing ? "…" : "Not connecting? Allow through Windows Firewall"}
+                </button>
+              </div>
+            {:else if engine.listening?.error}
+              <p class="faint small">{engine.listening.error}</p>
+            {/if}
             {#if engine.error}<p class="faint small">{engine.error}</p>{/if}
           {/if}
         </div>
@@ -167,6 +242,8 @@
   }
   .stage {
     display: grid;
+    /* minmax(0, 1fr): a wide top bar must never push the stage under the side panel. */
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr auto;
     gap: 14px;
     padding: 14px 16px 16px 18px;
@@ -178,6 +255,8 @@
     align-items: center;
     gap: 12px;
     height: 40px;
+    min-width: 0;
+    overflow: hidden;
   }
   .brand {
     display: flex;
@@ -392,6 +471,73 @@
   }
   .faint {
     color: var(--faint) !important;
+  }
+  .notice {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    z-index: 3;
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    padding: 10px 14px;
+    border-radius: 12px;
+    background: var(--panel-2);
+    color: var(--dim);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .notice b {
+    color: var(--text);
+  }
+  .pc-address {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--dim);
+    font-size: 13px;
+    user-select: text;
+  }
+  .topbar > :global(*) {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .topbar > .spacer {
+    flex-shrink: 1;
+  }
+  @media (max-width: 1440px) {
+    .wide-only {
+      display: none;
+    }
+  }
+  /* Narrow windows: icon-only buttons so the top bar fits beside the side panel. */
+  @media (max-width: 1280px) {
+    .btn-label {
+      display: none;
+    }
+  }
+  .pc-address b {
+    font-family: var(--mono);
+    color: var(--text);
+    user-select: all;
+  }
+  .actions {
+    display: flex;
+    gap: 10px;
+  }
+  .dial {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .dial-address {
+    font-family: var(--mono);
+    font-size: 26px;
+    font-weight: 700;
+    user-select: all;
   }
   .small {
     font-size: 12.5px;

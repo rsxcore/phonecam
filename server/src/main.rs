@@ -2,7 +2,8 @@
 //!
 //! `phonecam-server [--connect HOST[:PORT]] [--test] [--status FILE]`
 //! prints one JSON event per line and forwards JSON lines from stdin to the
-//! phone as control messages.
+//! phone as control messages. Phones can also dial the PC on port 8090; a new
+//! one waits for `{"approve": true}` (or `false`) on stdin.
 
 use std::io::BufRead;
 use std::sync::Arc;
@@ -40,8 +41,12 @@ fn main() {
         engine.set_test_pattern(true);
     }
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-        if serde_json::from_str::<Value>(&line).is_ok() {
-            engine.send_control(&line);
+        match serde_json::from_str::<Value>(&line) {
+            Ok(v) if v.get("approve").is_some() => engine.approve(v["approve"].as_bool() == Some(true)),
+            Ok(_) => {
+                engine.send_control(&line);
+            }
+            Err(_) => {}
         }
     }
     // stdin closed (e.g. started without a console): keep serving the camera.

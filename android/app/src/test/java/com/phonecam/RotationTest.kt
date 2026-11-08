@@ -16,6 +16,17 @@ class RotationTest {
         assertEquals(90, Orientation.baseRotation(st))
     }
 
+    /** Galaxy S21+ (SM-G996B): same front matrix as above, sensor at 270, and 270 is what shows upright on the PC. */
+    @Test fun mirroredFrontCameraTrustsSensorOrientation() {
+        val st = floatArrayOf(0f, -1f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f)
+        assertEquals(270, Orientation.resolveBase(Orientation.baseRotation(st), 270, front = true))
+        // Agreeing values and back cameras are left alone.
+        assertEquals(90, Orientation.resolveBase(90, 90, front = true))
+        assertEquals(90, Orientation.resolveBase(90, 270, front = false))
+        // No measurement yet: fall back to the sensor.
+        assertEquals(270, Orientation.resolveBase(-1, 270, front = true))
+    }
+
     @Test fun plainBufferNeedsNoRotation() {
         val st = floatArrayOf(1f, 0f, 0f, 0f, 0f, -1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f)
         assertEquals(0, Orientation.baseRotation(st))

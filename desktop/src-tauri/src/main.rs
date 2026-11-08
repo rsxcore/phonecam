@@ -126,6 +126,115 @@ async fn register_camera_system() -> Result<bool, String> {
     Ok(vcam::system_registered())
 }
 
+#[tauri::command]
+fn reconnect(state: State<AppState>) {
+    if let Some(e) = engine(&state) {
+        e.reconnect();
+    }
+}
+
+/// Answers the `approve` event for a new phone that dialled this PC.
+#[tauri::command]
+fn approve_phone(state: State<AppState>, ok: bool) {
+    if let Some(e) = engine(&state) {
+        e.approve(ok);
+    }
+}
+
+/// Lets phones reach the listening port through Windows Firewall on every
+/// network profile; a cable to the modem is often a "Public" network, where
+/// Windows blocks incoming connections by default (one UAC prompt).
+#[tauri::command]
+async fn allow_firewall() -> Result<(), String> {
+    vcam::run_elevated(windows::core::w!("--allow-firewall"))
+}
+
+/// RivaTuner Statistics Server (bundled with MSI Afterburner) injects its
+/// overlay into WebView2, and that hook crashes WebView2 as soon as the
+/// preview draws video: the window turns black while the camera keeps working.
+fn rtss_running() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq RTSS.exe", "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("RTSS.exe"))
+}
+
+/// RivaTuner's per-app profile for WebView2. Disabling hooking there is what
+/// RivaTuner's own "Application detection level: None" writes.
+fn rtss_profile() -> std::path::PathBuf {
+    let base = std::env::var_os("ProgramFiles(x86)").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Program Files (x86)".into());
+    base.join("RivaTuner Statistics Server").join("Profiles").join("msedgewebview2.exe.cfg")
+}
+
+fn rtss_excluded() -> bool {
+    std::fs::read_to_string(rtss_profile()).is_ok_and(|s| s.lines().any(|l| l.trim() == "EnableHooking=0"))
+}
+
+/// Elevated helper for `exclude_rtss`. Writes only the hooking switch, so an
+/// existing profile for WebView2 loses nothing else.
+fn exclude_from_rtss() -> bool {
+    let path = rtss_profile();
+    if !path.parent().is_some_and(|p| p.is_dir()) {
+        return false;
+    }
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out = String::new();
+    let (mut in_hooking, mut done) = (false, false);
+    for line in old.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            if in_hooking && !done {
+                out.push_str("EnableHooking=0\r\n");
+                done = true;
+            }
+            in_hooking = t.eq_ignore_ascii_case("[Hooking]");
+        } else if in_hooking && t.starts_with("EnableHooking=") {
+            out.push_str("EnableHooking=0\r\n");
+            done = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    if !done {
+        if !in_hooking {
+            out.push_str("[Hooking]\r\n");
+        }
+        out.push_str("EnableHooking=0\r\n");
+    }
+    std::fs::write(&path, out).is_ok()
+}
+
+/// Turns RivaTuner's overlay off for WebView2 (one UAC prompt).
+#[tauri::command]
+async fn exclude_rtss() -> Result<(), String> {
+    vcam::run_elevated(windows::core::w!("--exclude-rtss"))?;
+    if rtss_excluded() {
+        Ok(())
+    } else {
+        Err("RivaTuner was not found in its usual folder. Add msedgewebview2.exe in RivaTuner and set Application detection level to None.".into())
+    }
+}
+
+/// Elevated helper for `allow_firewall`: one inbound rule for the listening port.
+fn add_firewall_rule() -> bool {
+    use std::os::windows::process::CommandExt;
+    let netsh = |args: &[&str]| {
+        std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall"])
+            .args(args)
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let name = "name=PhoneCam (phones connecting)";
+    netsh(&["delete", "rule", name]);
+    let port = format!("localport={}", proto::LISTEN_PORT);
+    netsh(&["add", "rule", name, "dir=in", "action=allow", "protocol=TCP", &port, "profile=any"])
+}
+
 /// Binary preview packets: `0x10 codec w h fps` for a new stream, `0x11 flags
 /// pts rotation data` per frame. Mirrors the phone protocol so the page can
 /// feed WebCodecs directly.
@@ -207,6 +316,14 @@ fn main() {
             Err(_) => 2,
         });
     }
+    if std::env::args().any(|a| a == "--allow-firewall") {
+        std::process::exit(if add_firewall_rule() { 0 } else { 2 });
+    }
+    if std::env::args().any(|a| a == "--exclude-rtss") {
+        std::process::exit(if exclude_from_rtss() { 0 } else { 2 });
+    }
+    // Checked once: the warning only matters while RivaTuner can still hook WebView2.
+    let rtss = rtss_running() && !rtss_excluded();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .manage(AppState::default())
@@ -222,9 +339,13 @@ fn main() {
             forget_phone,
             reinstall_camera,
             uninstall_camera,
-            register_camera_system
+            register_camera_system,
+            approve_phone,
+            allow_firewall,
+            reconnect,
+            exclude_rtss
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
             let camera = vcam::install();
             let camera_event = match &camera {
@@ -235,6 +356,9 @@ fn main() {
                 Err(e) => json!({ "event": "camera", "ok": false, "text": e }),
             };
             app.state::<AppState>().history.lock().unwrap().push(camera_event);
+            if rtss {
+                app.state::<AppState>().history.lock().unwrap().push(json!({ "event": "rtss" }));
+            }
             start_engine(&handle);
 
             // Closing the window keeps the camera running from the tray, so a

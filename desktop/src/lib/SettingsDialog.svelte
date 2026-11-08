@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { Link, MonitorPlay, RefreshCw, Smartphone, Trash2, X } from "@lucide/svelte";
+  import { Copy, Link, MonitorPlay, RefreshCw, ShieldCheck, Smartphone, Trash2, X } from "@lucide/svelte";
   import { onMount } from "svelte";
   import { engine } from "./engine.svelte";
 
@@ -72,6 +72,27 @@
           <button class="ghost danger" onclick={() => forget(p)}><Trash2 size={14} /> Forget</button>
         </div>
       {/each}
+    </section>
+
+    <section>
+      <h3><Smartphone size={15} /> Connect from the phone</h3>
+      {#if engine.listening?.address}
+        <p class="faint">
+          In PhoneCam on the phone, open settings → <b>Connect to PC</b> and type this address. Works even when the phone is on another
+          router.
+        </p>
+        <div class="inline">
+          <code class="pc-address">{engine.listening.address}</code>
+          <button class="ghost" onclick={async () => { await navigator.clipboard.writeText(engine.listening?.address ?? ""); message = "Address copied"; }}>
+            <Copy size={14} /> Copy
+          </button>
+          <button class="ghost" onclick={async () => { try { await engine.allowFirewall(); message = "Windows Firewall now lets phones connect on port " + engine.listening?.port + "."; } catch (e) { message = String(e); } }}>
+            <ShieldCheck size={14} /> Allow through firewall
+          </button>
+        </div>
+      {:else}
+        <p class="faint">{engine.listening?.error ?? "This PC has no network address yet. Connect it to your network."}</p>
+      {/if}
     </section>
 
     <section>
@@ -181,6 +202,14 @@
     display: flex;
     gap: 8px;
     margin-top: 10px;
+  }
+  .pc-address {
+    flex: 1;
+    align-self: center;
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 700;
+    user-select: all;
   }
   .faint {
     color: var(--faint);

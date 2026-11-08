@@ -57,6 +57,14 @@ impl Identity {
             return Ok(Self { cert: CertificateDer::from(cert), key, fingerprint });
         }
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let identity = Self::generate()?;
+        std::fs::write(&cert_path, identity.cert.as_ref()).map_err(|e| e.to_string())?;
+        std::fs::write(&key_path, &identity.key).map_err(|e| e.to_string())?;
+        Ok(identity)
+    }
+
+    /// A new identity that is not saved anywhere.
+    pub fn generate() -> Result<Self, String> {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(|e| e.to_string())?;
         let mut params = rcgen::CertificateParams::new(vec!["phonecam-pc".into()]).map_err(|e| e.to_string())?;
         params.distinguished_name.push(rcgen::DnType::CommonName, format!("PhoneCam {}", computer_name()));
@@ -64,8 +72,6 @@ impl Identity {
         params.not_after = rcgen::date_time_ymd(2100, 1, 1);
         let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
         let (cert, key) = (cert.der().to_vec(), key.serialize_der());
-        std::fs::write(&cert_path, &cert).map_err(|e| e.to_string())?;
-        std::fs::write(&key_path, &key).map_err(|e| e.to_string())?;
         let fingerprint = fingerprint(&cert);
         Ok(Self { cert: CertificateDer::from(cert), key, fingerprint })
     }

@@ -2,7 +2,9 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 if ((Test-Path 'android\phonecam-release.jks') -or (Test-Path 'android\signing.properties')) { throw 'A signing key already exists. It must not be replaced: Android updates require the original key.' }
 New-Item -ItemType Directory -Force work | Out-Null
-$secret = [Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
+$bytes = New-Object byte[] 24
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$secret = -join ($bytes | ForEach-Object { $_.ToString('X2') })
 $secretFile = Join-Path $PSScriptRoot 'work\signing-password.txt'
 [IO.File]::WriteAllText($secretFile, $secret)
 $keytool = if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME 'bin\keytool.exe' } else { (Get-Command keytool -ErrorAction Stop).Source }

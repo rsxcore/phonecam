@@ -21,6 +21,8 @@ object Protocol {
     const val VERSION = 2
     const val PORT = 8080
     const val DISCOVERY_PORT = 5888
+    /** Where the PC listens for phones that dial it (`LISTEN_PORT` in `server/src/proto.rs`). */
+    const val PC_PORT = 8090
     const val MAX_MESSAGE = 16 * 1024 * 1024
 
     /** Phone → PC, JSON: device name, model and camera capabilities. */

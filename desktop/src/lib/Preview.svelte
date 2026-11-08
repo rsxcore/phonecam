@@ -17,6 +17,10 @@
     const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true })!;
     let decoder: VideoDecoder | null = null;
     let codec = 1;
+    // Stream size from the config packet. HEVC decoders in WebView2 need it:
+    // configured without it after a resolution change, one kept producing
+    // 1280x720 frames from a 2560x1440 stream (a zoomed-in corner).
+    let size = { width: 0, height: 0 };
     let waitingForKey = true;
     let rotation = 0;
     let latest: VideoFrame | null = null;
@@ -77,8 +81,9 @@
       const bytes = new Uint8Array(buffer);
       const view = new DataView(buffer);
       if (bytes[0] === 0x10) {
-        log(`config packet codec=${bytes[1]}`);
         codec = bytes[1];
+        size = { width: view.getUint16(2, true), height: view.getUint16(4, true) };
+        log(`config packet codec=${codec} ${size.width}x${size.height}`);
         reset();
         return;
       }
@@ -90,6 +95,10 @@
       if (waitingForKey) {
         if (!key) return;
         const config: VideoDecoderConfig = { codec: codecString(data), optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" };
+        if (size.width && size.height) {
+          config.codedWidth = size.width;
+          config.codedHeight = size.height;
+        }
         decoder = new VideoDecoder({
           output: (frame) => {
             if (outputs++ % 300 === 0) log(`output #${outputs} ${frame.displayWidth}x${frame.displayHeight}`);
@@ -101,7 +110,7 @@
             reset();
           },
         });
-        log(`configure ${config.codec}`);
+        log(`configure ${config.codec} ${config.codedWidth ?? "?"}x${config.codedHeight ?? "?"}`);
         try {
           decoder.configure(config);
         } catch (err) {

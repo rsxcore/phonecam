@@ -71,6 +71,12 @@ object CameraCatalog {
             REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA !in caps || c.physicalCameraIds.none { it in ids }
         }
         val lenses = physical.mapNotNull { (id, c) -> describe(id, c) }
+        // Horizontal field of view, as sensor width over focal length (enough to compare lenses).
+        val fov = physical.associate { (id, c) ->
+            val width = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)?.width ?: 0f
+            val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
+            id to if (focal > 0f) width / focal else 0f
+        }
         val backs = lenses.filter { !it.front }.sortedBy { it.focalMm }
         val main = backs.maxByOrNull { it.modes.size * 100 + (if (it.manualSensor) 10 else 0) }
         return lenses.map { lens ->
@@ -81,7 +87,24 @@ object CameraCatalog {
                 else -> "Telephoto"
             }
             lens.copy(name = name)
-        }.sortedBy { listOf("Main", "Ultra-wide", "Telephoto", "Front").indexOf(it.name) }
+        }
+            // Some phones expose one camera twice with different crops: a Galaxy
+            // S21+ lists its front camera as id 1 (68° wide) and id 3 (61°, a crop
+            // that looks zoomed in). Widest first, the others named "narrow";
+            // repeats with the same field of view are numbered.
+            .sortedWith(compareBy<Lens> { listOf("Main", "Ultra-wide", "Telephoto", "Front").indexOf(it.name) }
+                .thenByDescending { fov[it.id] ?: 0f })
+            .let { named ->
+                named.mapIndexed { i, lens ->
+                    val same = named.take(i).filter { it.name == lens.name }
+                    when {
+                        same.isEmpty() -> lens
+                        same.all { (fov[it.id] ?: 0f) > (fov[lens.id] ?: 0f) * 1.03f } ->
+                            lens.copy(name = "${lens.name} (narrow)" + if (same.size > 1) " ${same.size}" else "")
+                        else -> lens.copy(name = "${lens.name} ${same.size + 1}")
+                    }
+                }
+            }
     }
 
     private fun describe(id: String, c: CameraCharacteristics): Lens? {

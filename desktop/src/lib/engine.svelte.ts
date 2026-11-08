@@ -81,6 +81,12 @@ class EngineStore {
   thermal = $state(0);
   throttled = $state(false);
   phoneError = $state<string | null>(null);
+  /** Where phones can dial this PC (`address` is null when the PC has no network). */
+  listening = $state<{ address: string | null; port: number; error?: string } | null>(null);
+  /** A new phone that dialled in and waits to be allowed. */
+  approval = $state<{ name: string; code: string; address: string } | null>(null);
+  /** RivaTuner (MSI Afterburner's overlay) is running; its hook crashes the preview. */
+  rtss = $state(false);
 
   private heldUntil = new Map<string, number>();
   private pending: Partial<Settings> = {};
@@ -124,6 +130,26 @@ class EngineStore {
     return ok;
   }
 
+  /** Turns RivaTuner's overlay off for WebView2; hides the warning once it worked. */
+  async excludeRtss() {
+    await invoke("exclude_rtss");
+    this.rtss = false;
+  }
+
+  /** Drops the current connection and connects again, to the same pinned address if any. */
+  reconnect() {
+    return invoke("reconnect");
+  }
+
+  approve(ok: boolean) {
+    this.approval = null;
+    return invoke("approve_phone", { ok });
+  }
+
+  allowFirewall() {
+    return invoke("allow_firewall");
+  }
+
   toggleTestPattern() {
     this.testPattern = !this.testPattern;
     invoke("test_pattern", { on: this.testPattern });
@@ -143,13 +169,24 @@ class EngineStore {
         this.pairingCode = e.code;
         this.pairingMismatch = e.mismatch;
         break;
+      case "rtss":
+        this.rtss = true;
+        break;
+      case "approve":
+        this.approval = { name: e.name, code: e.code, address: e.address };
+        break;
+      case "listening":
+        this.listening = { address: e.address, port: e.port, error: e.error };
+        break;
       case "connected":
         this.phase = "live";
         this.error = null;
         this.pairingCode = null;
+        this.approval = null;
         this.address = e.address;
         break;
       case "disconnected":
+        this.approval = null;
         this.phase = "searching";
         this.stats = null;
         this.error = e.reason && !String(e.reason).startsWith("Phone not found") ? e.reason : null;

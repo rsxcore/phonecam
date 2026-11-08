@@ -14,7 +14,8 @@
 </script>
 
 <div class="seg" class:wrap>
-  {#each options as o (o.label)}
+  <!-- Keyed by value: labels can repeat (a phone may report two lenses named "Front"). -->
+  {#each options as o (o.value)}
     <button class:on={o.value === value} disabled={o.disabled} onclick={() => onchange(o.value)} title={o.hint ?? ""}>
       <span>{o.label}</span>
       {#if o.hint}<small>{o.hint}</small>{/if}

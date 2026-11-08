@@ -1,0 +1,15 @@
+pwsh -File .\build.ps1 -Test
+winget install Microsoft.OpenJDK.17
+winget install Google.AndroidStudio
+setx ANDROID_HOME "%LOCALAPPDATA%\Android\Sdk"
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
+android\gradlew.bat -p android assembleRelease
+gh auth login
+gh auth login --web
+copy /Y desktop\src-tauri\target\release\phonecam.exe dist\PhoneCam.exe
+Copy-Item desktop\src-tauri\target\release\phonecam.exe dist\PhoneCam.exe -Force
+.\scripts\graft-query.ps1
+.\scripts\graft-query.ps1 vcam
+.\scripts\graft-query.ps1 "vcam"
+.\scripts\graft-query.ps1 HELP
+.\scripts\graft-query.ps1 viz

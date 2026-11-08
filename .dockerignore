@@ -1,0 +1,18 @@
+# Only source goes into the Graft build context (docker/Dockerfile.graft).
+# Secrets: the APK signing key must never land in an image layer or build cache.
+android/signing.properties
+android/*.jks
+android/local.properties
+work/
+
+# Build output and caches: large, and not source.
+dist/
+**/target/
+**/node_modules/
+**/build/
+**/.gradle/
+vcam/out/
+desktop/dist/
+graft/
+.git/
+PowerShellHistory.txt

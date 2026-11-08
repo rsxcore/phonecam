@@ -2,6 +2,7 @@
 //! video and publishes it to the virtual camera. Used by both the desktop app
 //! and the `phonecam-server` command-line tool.
 
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,9 @@ enum Job {
     Lost,
 }
 
+/// A phone that dialled the PC, with the time it arrived.
+type Dialled = (TcpStream, SocketAddr, Instant);
+
 struct Shared {
     events: EventSink,
     video: Option<VideoSink>,
@@ -40,6 +44,8 @@ struct Shared {
     control: Mutex<Option<proto::Sender>>,
     target: Mutex<Option<String>>,
     shm: Mutex<shm::Shm>,
+    /// Set while an unknown phone that dialled in waits for the user's answer.
+    approval: Mutex<Option<SyncSender<bool>>>,
 }
 
 impl Shared {
@@ -73,8 +79,33 @@ impl Engine {
             control: Mutex::new(None),
             target: Mutex::new(address),
             shm: Mutex::new(shm),
+            approval: Mutex::new(None),
         });
         shared.emit(json!({ "event": "identity", "name": identity::computer_name(), "fingerprint": identity.fingerprint }));
+
+        // Phones can also dial the PC, which works when the phone sits behind
+        // a router (its own NAT) that the PC cannot connect into.
+        let (dialled_tx, dialled) = mpsc::channel::<Dialled>();
+        match TcpListener::bind(("0.0.0.0", proto::LISTEN_PORT)) {
+            Ok(listener) => {
+                let address = proto::local_ipv4().map(|ip| format!("{ip}:{}", proto::LISTEN_PORT));
+                shared.emit(json!({ "event": "listening", "port": proto::LISTEN_PORT, "address": address }));
+                thread::Builder::new()
+                    .name("phonecam-listen".into())
+                    .spawn(move || {
+                        for sock in listener.incoming().flatten() {
+                            if let Ok(from) = sock.peer_addr() {
+                                let _ = dialled_tx.send((sock, from, Instant::now()));
+                            }
+                        }
+                    })
+                    .unwrap();
+            }
+            Err(e) => shared.emit(json!({
+                "event": "listening", "port": proto::LISTEN_PORT, "address": null,
+                "error": format!("Port {} is in use: {e}", proto::LISTEN_PORT),
+            })),
+        }
 
         let (tx, rx) = mpsc::sync_channel::<Job>(16);
         let skip = Arc::new(AtomicBool::new(false));
@@ -90,7 +121,7 @@ impl Engine {
             let shared = shared.clone();
             thread::Builder::new()
                 .name("phonecam-net".into())
-                .spawn(move || connection_loop(shared, identity, tls, tx, skip))
+                .spawn(move || connection_loop(shared, identity, tls, tx, skip, dialled))
                 .unwrap();
         }
         Ok(Self { shared })
@@ -109,6 +140,20 @@ impl Engine {
         *self.shared.target.lock().unwrap() = address;
         if let Some(sender) = self.shared.control.lock().unwrap().as_ref() {
             sender.send(DISCONNECT, &[]);
+        }
+    }
+
+    /// Drops the current connection; the engine then connects again on its own.
+    pub fn reconnect(&self) {
+        if let Some(sender) = self.shared.control.lock().unwrap().as_ref() {
+            sender.send(DISCONNECT, &[]);
+        }
+    }
+
+    /// Answers an `approve` event: lets a new phone that dialled in use the camera, or not.
+    pub fn approve(&self, ok: bool) {
+        if let Some(answer) = self.shared.approval.lock().unwrap().take() {
+            let _ = answer.try_send(ok);
         }
     }
 
@@ -132,27 +177,51 @@ fn connection_loop(
     tls: Arc<rustls::ClientConfig>,
     tx: SyncSender<Job>,
     skip: Arc<AtomicBool>,
+    dialled: Receiver<Dialled>,
 ) {
+    let pc_name = identity::computer_name();
+    let mut waiting = None;
     loop {
-        let pinned = shared.target.lock().unwrap().clone();
-        let target = match pinned {
-            Some(a) => Some(a),
-            None => find_phone(&shared),
-        };
-        let result = match target {
-            Some(t) => {
-                shared.emit(json!({ "event": "connecting", "address": t }));
-                shared.status(&format!("Connecting to {t}…"));
-                receive(&t, &shared, &tls, &me, &tx, &skip)
+        // A phone that dialled in wins over searching for one.
+        let result = match waiting.take().or_else(|| next_dialled(&dialled, Duration::ZERO)) {
+            Some((sock, from)) => {
+                let from = from.to_string();
+                shared.emit(json!({ "event": "connecting", "address": from, "incoming": true }));
+                shared.status(&format!("Phone at {from} is connecting…"));
+                proto::Connection::over(sock, tls.clone(), &pc_name)
+                    .and_then(|conn| receive(conn, &from, true, &shared, &me, &tx, &skip))
             }
-            None => Err("Phone not found. Open PhoneCam on the phone (same Wi-Fi).".into()),
+            None => {
+                let pinned = shared.target.lock().unwrap().clone();
+                match pinned.or_else(|| find_phone(&shared)) {
+                    Some(t) => {
+                        shared.emit(json!({ "event": "connecting", "address": t }));
+                        shared.status(&format!("Connecting to {t}…"));
+                        proto::Connection::open(&t, tls.clone(), &pc_name)
+                            .and_then(|conn| receive(conn, &t, false, &shared, &me, &tx, &skip))
+                    }
+                    None => Err("Phone not found. Open PhoneCam on the phone and connect it to this PC.".into()),
+                }
+            }
         };
         *shared.control.lock().unwrap() = None;
         let error = result.err().unwrap_or_else(|| "Disconnected".into());
         let _ = tx.send(Job::Lost);
         shared.emit(json!({ "event": "disconnected", "reason": error }));
         shared.status(&format!("Reconnecting: {error}"));
-        thread::sleep(Duration::from_millis(800));
+        waiting = next_dialled(&dialled, Duration::from_millis(800));
+    }
+}
+
+/// The next phone that dialled in within `wait`. The phone abandons a TLS
+/// handshake after 5 seconds, so sockets that waited longer are skipped.
+fn next_dialled(dialled: &Receiver<Dialled>, wait: Duration) -> Option<(TcpStream, SocketAddr)> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let (sock, from, at) = dialled.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()?;
+        if at.elapsed() < Duration::from_secs(4) {
+            return Some((sock, from));
+        }
     }
 }
 
@@ -183,16 +252,19 @@ fn find_phone(shared: &Shared) -> Option<String> {
     proto::scan_subnet(proto::DEFAULT_PORT).into_iter().next()
 }
 
+/// `dialled_in`: the phone opened the connection, so `address` is only where
+/// it came from (often its router) and not a place to connect back to.
 fn receive(
+    mut conn: proto::Connection,
     address: &str,
+    dialled_in: bool,
     shared: &Shared,
-    tls: &Arc<rustls::ClientConfig>,
     me: &identity::Identity,
     tx: &SyncSender<Job>,
     skip: &AtomicBool,
 ) -> Result<(), String> {
-    let mut conn = proto::Connection::open(address, tls.clone(), &identity::computer_name())?;
     let phone_fp = conn.phone_fingerprint.clone();
+    let known = identity::phones().into_iter().find(|p| p.fingerprint == phone_fp);
     let expected = identity::verification_code(&me.fingerprint, &phone_fp);
     let mut mismatch = false;
     let first = conn.handshake(&mut |p| match p {
@@ -206,8 +278,31 @@ fn receive(
     if mismatch {
         return Err("Pairing codes differ: the connection may be intercepted".into());
     }
+    // Anyone on the network can dial the PC, and the phone app approving the
+    // pairing proves nothing about who holds it: a new phone that dialled in
+    // only gets to feed the camera once the user allows it here.
+    if dialled_in && known.is_none() {
+        let name = match &first {
+            proto::Message::Hello(text) => serde_json::from_str::<Value>(text)
+                .ok()
+                .and_then(|v| v.get("device")?.as_str().map(str::to_string))
+                .unwrap_or_else(|| "Phone".into()),
+            _ => "Phone".into(),
+        };
+        let (answer_tx, answer) = mpsc::sync_channel(1);
+        *shared.approval.lock().unwrap() = Some(answer_tx);
+        shared.emit(json!({ "event": "approve", "name": name, "address": address, "code": expected }));
+        shared.status(&format!("Allow {name} to use the camera? Code {expected}"));
+        let ok = answer.recv_timeout(Duration::from_secs(90)).unwrap_or(false);
+        *shared.approval.lock().unwrap() = None;
+        if !ok {
+            return Err(format!("{name} was not allowed on this PC"));
+        }
+    }
     *shared.control.lock().unwrap() = Some(conn.sender());
-    shared.emit(json!({ "event": "connected", "address": address, "fingerprint": phone_fp }));
+    shared.emit(json!({ "event": "connected", "address": address, "fingerprint": phone_fp, "incoming": dialled_in }));
+    // Where the PC can reach the phone; a dialled-in phone keeps the last one that worked.
+    let reach = if dialled_in { known.map(|p| p.address).unwrap_or_default() } else { address.to_string() };
     let mut pending = Some(first);
     loop {
         let message = match pending.take() {
@@ -220,7 +315,11 @@ fn receive(
                     let kind = if v.get("lenses").is_some() { "hello" } else { "state" };
                     if kind == "hello" {
                         let name = v.get("device").and_then(Value::as_str).unwrap_or("Phone").to_string();
-                        identity::remember(&identity::Phone { fingerprint: phone_fp.clone(), name, address: address.to_string() });
+                        // A dialled-in phone reports its own address (newer apps), so
+                        // the PC can also reach it later on a network they share.
+                        let own = v.get("address").and_then(Value::as_str).and_then(|a| proto::parse_address(a).ok());
+                        let address = if dialled_in { own.unwrap_or_else(|| reach.clone()) } else { reach.clone() };
+                        identity::remember(&identity::Phone { fingerprint: phone_fp.clone(), name, address });
                     }
                     shared.emit(json!({ "event": kind, "data": v }));
                 }

@@ -39,7 +39,7 @@ flowchart LR
 
 ### Wire protocol (v2)
 
-TLS 1.3, certificates on both sides. After the handshake:
+TLS 1.3, certificates on both sides. Either side may open the TCP connection (see **Connecting** below), but the phone is always the TLS server and the PC the TLS client. After the handshake:
 
 1. PC → `CLIENT_HELLO {"name"}`
 2. Phone → preamble `PCAM`, u16 version = 2, u16 reserved
@@ -63,7 +63,10 @@ Messages are `u8 type, u32 length (LE), payload`:
 
 **Pairing code:** first 3 bytes of SHA-256 of `"min(fpA,fpB):max(fpA,fpB)"`, mod 10⁶, computed independently on both sides.
 
-**Discovery:** last working address → UDP `PHONECAM_DISCOVER_V2` broadcast to `255.255.255.255` and the subnet's `.255` on port 5888 (reply `PHONECAM_V2:port:fingerprint16:model`) → TCP scan of the local /24 on port 8080. The Windows firewall often drops broadcast replies; outgoing TCP always works.
+**Connecting:** two directions, whichever works first.
+
+- *PC → phone (port 8080):* last working address → UDP `PHONECAM_DISCOVER_V2` broadcast to `255.255.255.255` and the subnet's `.255` on port 5888 (reply `PHONECAM_V2:port:fingerprint16:model`) → TCP scan of the local /24 on port 8080. The Windows firewall often drops broadcast replies; outgoing TCP always works.
+- *Phone → PC (port 8090):* the PC listens and shows its address; the user types it in the phone's settings, and the phone redials every 2 s while no PC is connected. This is the way when the phone sits behind its own router (e.g. PC on the modem at `192.168.100.2`, phone on a router's Wi-Fi at `192.168.0.x`): the router's NAT lets the phone out but nothing in. Windows blocks incoming connections on "Public" networks, so the app offers a firewall rule (one UAC prompt, `--allow-firewall`). A phone the PC does not know yet must also be allowed on the PC (`approve` event), since anyone on the network can dial in.
 
 ### Shared memory (v2)
 
@@ -78,7 +81,7 @@ Per user (HKCU) on every start of the desktop app, from `%LOCALAPPDATA%\PhoneCam
 Requirements: Windows x64, Visual Studio Build Tools (C++), Rust (MSVC), Node.js 20+, JDK 17+ (Gradle provisions 17), Android SDK 36.
 
 ```powershell
-pwsh -File .\build.ps1 -Test
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
 ```
 
 This builds `vcam\out\PhoneCam.dll`, then the desktop app (which embeds the DLL), then the release APK. Output: `dist\PhoneCam.exe` and `dist\PhoneCam.apk`.
@@ -104,6 +107,6 @@ cargo build --release --manifest-path server\Cargo.toml   # CLI receiver
 | `tests\native.bat` | 1000 COM lifetime cycles, format validation, NV12 scaling/letterbox and NV12→RGB conversion |
 | `python tests\probe.py HOST 10 out.h264 --set '{"fps":60}'` | Live stream against a paired phone: frame pacing, arrival jitter, bitrate |
 | `tests\enum_like_obs.cpp` | Enumerates capture devices the way OBS does |
-| `phonecam-server.exe --connect HOST` | Receiver without UI; prints JSON events, forwards JSON lines from stdin as control |
+| `phonecam-server.exe --connect HOST` | Receiver without UI; prints JSON events, forwards JSON lines from stdin as control. Also listens on 8090; answer a new phone with `{"approve": true}` |
 
 Useful environment variables: `PHONECAM_LOG=path` (desktop app event log), `PHONECAM_SOFTWARE_DECODE=1` (disable GPU decoding), `PHONECAM_PROFILE=1` (per-frame timings in the CLI).

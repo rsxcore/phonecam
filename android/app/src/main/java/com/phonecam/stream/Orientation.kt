@@ -28,6 +28,20 @@ object Orientation {
     }
 
     /**
+     * The base rotation to use, given [measured] from [baseRotation] (-1 if
+     * none yet). A mirrored transform cannot tell θ from θ+180: mirroring
+     * across x after θ equals mirroring across y after θ+180. Front cameras are
+     * always mirrored, and phones differ in which form they report (a Nothing
+     * Phone (1) and a Galaxy S21+ give the same matrix for opposite answers),
+     * so SENSOR_ORIENTATION settles it whenever it is one of the two.
+     */
+    fun resolveBase(measured: Int, sensorOrientation: Int, front: Boolean): Int = when {
+        measured < 0 -> sensorOrientation
+        front && (measured - sensorOrientation + 360) % 180 == 0 -> sensorOrientation
+        else -> measured
+    }
+
+    /**
      * Clockwise rotation the PC applies to an encoded frame. [device] is the
      * OrientationEventListener angle snapped to 0/90/180/270. Same sign
      * convention as Camera2's JPEG_ORIENTATION: add it for back cameras,

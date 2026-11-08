@@ -9,6 +9,9 @@ use std::time::Duration;
 
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DISCOVERY_PORT: u16 = 5888;
+/// The PC listens here for phones that dial it (the phone may sit behind a
+/// router the PC cannot reach into).
+pub const LISTEN_PORT: u16 = 8090;
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 pub const HELLO: u8 = 0x01;
@@ -94,6 +97,13 @@ impl Connection {
             .iter()
             .find_map(|a| TcpStream::connect_timeout(a, Duration::from_secs(3)).ok())
             .ok_or_else(|| "Phone unavailable. Check Wi-Fi and that PhoneCam is open.".to_string())?;
+        Self::over(sock, config, pc_name)
+    }
+
+    /// Completes TLS and introduces the PC on a socket either side opened.
+    /// The phone is always the TLS server, also when it dialled the PC, so
+    /// pairing and certificate pinning work the same in both directions.
+    pub fn over(sock: TcpStream, config: std::sync::Arc<rustls::ClientConfig>, pc_name: &str) -> Result<Self, String> {
         sock.set_nodelay(true).map_err(|e| e.to_string())?;
         sock.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
         let name = rustls::pki_types::ServerName::try_from("phonecam.local").unwrap();
@@ -358,6 +368,54 @@ pub fn scan_subnet(port: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The phone dials the PC but stays the TLS server: a stand-in phone
+    /// connects to a listening PC, and the PC still gets the preamble and HELLO.
+    #[test]
+    fn phone_can_dial_the_pc() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let phone = std::thread::spawn(move || {
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["phonecam.local".into()]).unwrap().self_signed(&key).unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+                )
+                .unwrap();
+            let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut tls = rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap();
+            let mut s = rustls::Stream::new(&mut tls, &mut sock);
+            s.write_all(b"PCAM\x02\x00\x00\x00").unwrap();
+            let mut head = [0u8; 5];
+            s.read_exact(&mut head).unwrap();
+            let mut name = vec![0u8; u32::from_le_bytes(head[1..5].try_into().unwrap()) as usize];
+            s.read_exact(&mut name).unwrap();
+            let hello = br#"{"device":"Test phone","lenses":[]}"#;
+            s.write_all(&[HELLO]).unwrap();
+            s.write_all(&(hello.len() as u32).to_le_bytes()).unwrap();
+            s.write_all(hello).unwrap();
+            s.flush().unwrap();
+            let _ = s.read(&mut head); // until the PC hangs up
+            (head[0], String::from_utf8(name).unwrap())
+        });
+
+        let (sock, _) = listener.accept().unwrap();
+        let pc = crate::identity::Identity::generate().unwrap();
+        let mut conn = Connection::over(sock, pc.client_config().unwrap(), "Test PC").unwrap();
+        assert_eq!(conn.phone_fingerprint.len(), 64);
+        match conn.handshake(&mut |_| panic!("no pairing expected")).unwrap() {
+            Message::Hello(text) => assert!(text.contains("Test phone")),
+            _ => panic!("expected HELLO"),
+        }
+        drop(conn);
+        let (kind, name) = phone.join().unwrap();
+        assert_eq!((kind, name.as_str()), (CLIENT_HELLO, r#"{"name":"Test PC"}"#));
+    }
 
     #[test]
     fn addresses() {

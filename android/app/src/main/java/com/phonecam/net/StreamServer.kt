@@ -150,11 +150,38 @@ class StreamServer(
         c.queue.offerFirst(out)
     }
 
+    /** Drops the connected PC; the dialer (or the PC's own search) connects again. */
+    fun dropClient() {
+        client?.let(::detach)
+    }
+
+    /**
+     * Connects to a PC that listens for phones, for when the PC cannot reach
+     * the phone (e.g. the phone is behind its own router). The phone stays the
+     * TLS server, so pairing works exactly as when the PC connects. Blocks
+     * until the PC is attached; returns null, or why it failed.
+     */
+    fun dial(host: String, port: Int): String? {
+        val raw = Socket()
+        return try {
+            raw.connect(InetSocketAddress(host, port), 3000)
+            val socket = Identity.sslContext().socketFactory.createSocket(raw, host, port, true) as SSLSocket
+            socket.useClientMode = false
+            socket.needClientAuth = true
+            socket.enabledProtocols = arrayOf("TLSv1.3")
+            authenticate(socket)
+        } catch (e: IOException) {
+            runCatching { raw.close() }
+            e.message ?: "Cannot reach $host"
+        }
+    }
+
     /**
      * TLS handshake, then CLIENT_HELLO, then either straight to streaming for a
-     * trusted PC or a pairing request the user answers on the phone.
+     * trusted PC or a pairing request the user answers on the phone. Returns
+     * null once the PC is attached, or why it was not.
      */
-    private fun authenticate(socket: SSLSocket) {
+    private fun authenticate(socket: SSLSocket): String? {
         try {
             socket.soTimeout = 5000
             socket.tcpNoDelay = true
@@ -176,14 +203,16 @@ class StreamServer(
                 onPairRequest(null)
                 Protocol.write(out, Protocol.PAIR_RESULT, JSONObject().put("ok", ok).toString().toByteArray())
                 out.flush()
-                if (!ok) { socket.close(); return }
+                if (!ok) { socket.close(); return "Not allowed on the phone" }
                 Identity.trust(context, pcFingerprint, pcName)
             }
             socket.soTimeout = 0
             attach(socket, pcName)
+            return null
         } catch (e: Exception) {
             Log.i(TAG, "Connection rejected: ${e.message}")
             runCatching { socket.close() }
+            return e.message ?: "Connection failed"
         }
     }
 

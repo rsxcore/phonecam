@@ -44,6 +44,10 @@ data class UiState(
     val thermal: Int = 0,
     /** Set when PhoneCam lowered the quality by itself to cool the phone down. */
     val throttled: Boolean = false,
+    /** The PC this phone dials ("host" or "host:port"); null means the PC connects to the phone. */
+    val pcAddress: String? = null,
+    /** Progress or the last failure of dialling [pcAddress]. */
+    val dialStatus: String? = null,
 )
 
 /**
@@ -53,6 +57,11 @@ data class UiState(
  */
 object Streamer {
     private const val TAG = "PhoneCam.Streamer"
+    private const val PREFS = "phonecam.connection"
+    private const val KEY_PC_ADDRESS = "pc_address"
+    private const val KEY_BROKEN_MODES = "broken_modes"
+    /** A working high-speed session delivers frames well within this. */
+    private const val HIGH_SPEED_GRACE_MS = 4000L
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
@@ -76,11 +85,13 @@ object Streamer {
 
     private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
     private var recoveries = 0
-    private var lastHealthyAt = 0L
 
     private var lastSentFrames = 0L
     private var lastSentBytes = 0L
     private var lastStatsAt = 0L
+    @Volatile private var dialing = false
+    /** Bumped by every pipeline start, so a delayed check knows whether it is stale. */
+    private var pipelineId = 0
 
     fun start(context: Context) {
         if (thread != null) return
@@ -90,14 +101,15 @@ object Streamer {
         thread = t
         val h = Handler(t.looper)
         handler = h
-        _state.update { it.copy(phase = Phase.STARTING, error = null, address = localIpv4()) }
+        val pcAddress = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_PC_ADDRESS, null)
+        _state.update { it.copy(phase = Phase.STARTING, error = null, address = localIpv4(), pcAddress = pcAddress) }
         h.post {
             try {
-                val lenses = CameraCatalog.load(ctx)
+                val lenses = withoutBrokenModes(ctx, CameraCatalog.load(ctx))
                 check(lenses.isNotEmpty()) { "No usable camera found" }
                 val settings = CameraSettings.load(ctx).sanitized(lenses)
                 _state.update { it.copy(lenses = lenses, settings = settings) }
-                logCapabilities(lenses)
+                logCapabilities(ctx, lenses)
                 val s = StreamServer(
                     context = ctx,
                     hello = ::hello,
@@ -108,6 +120,7 @@ object Streamer {
                 )
                 s.start()
                 server = s
+                startDialer(s)
                 engine = CameraEngine(ctx, h, onLive = { live -> _state.update { it.copy(live = live) } }, onError = ::cameraFailed)
                 startOrientation(ctx)
                 startThermal(ctx)
@@ -131,13 +144,48 @@ object Streamer {
             engine?.close(); engine = null
             relay?.release(); relay = null
             encoder?.release(); encoder = null
+            dialing = false
             server?.stop(); server = null
             done.countDown()
         }
         done.await(2, TimeUnit.SECONDS)
         thread?.quitSafely()
         thread = null; handler = null
-        _state.update { UiState(lenses = it.lenses, settings = it.settings) }
+        _state.update { UiState(lenses = it.lenses, settings = it.settings, pcAddress = it.pcAddress) }
+    }
+
+    /** Drops the current PC connection so it is made again from scratch. */
+    fun reconnect() {
+        _state.update { it.copy(dialStatus = null) }
+        server?.dropClient()
+    }
+
+    /** Sets the PC to dial, or null to go back to waiting for the PC to connect. */
+    fun setPcAddress(context: Context, address: String?) {
+        val clean = address?.trim()?.takeIf { it.isNotEmpty() }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_PC_ADDRESS, clean).apply()
+        _state.update { it.copy(pcAddress = clean, dialStatus = null) }
+    }
+
+    /**
+     * While no PC is connected, keeps dialling the PC the user entered. A PC
+     * behind the same router can still connect to the phone as before.
+     */
+    private fun startDialer(s: StreamServer) {
+        dialing = true
+        kotlin.concurrent.thread(name = "phonecam-dial", isDaemon = true) {
+            while (dialing && server === s) {
+                val target = _state.value.pcAddress
+                if (target != null && !s.connected) {
+                    val host = target.substringBeforeLast(':', target)
+                    val port = target.substringAfterLast(':', "").toIntOrNull() ?: Protocol.PC_PORT
+                    _state.update { it.copy(dialStatus = "Connecting to $host:$port…") }
+                    val error = s.dial(host, port)
+                    _state.update { it.copy(dialStatus = error?.let { e -> "$host:$port: $e" }) }
+                }
+                try { Thread.sleep(2000) } catch (_: InterruptedException) { break }
+            }
+        }
     }
 
     /** Updates settings from the UI or the PC. */
@@ -154,7 +202,10 @@ object Streamer {
         }
         h.post {
             val current = _state.value.settings
+            // Many HALs ignore exposure compensation while AE is locked, so the EV
+            // slider seemed dead with "Lock exposure" on. Moving EV unlocks AE.
             val next = change(current).sanitized(_state.value.lenses)
+                .let { if (it.ev != current.ev && it.aeLock && current.aeLock) it.copy(aeLock = false) else it }
             if (next == current) return@post
             _state.update { it.copy(settings = next, throttled = it.throttled && !next.needsRestart(current)) }
             appContext?.let { CameraSettings.save(it, next) }
@@ -189,6 +240,9 @@ object Streamer {
         relay?.release(); relay = null
         baseRotation = -1
         encoder?.release(); encoder = null
+        // The old session is closed: until the new one reports, there are no frames.
+        // (tick() treats a non-zero fps as "recovered", so it must not linger.)
+        _state.update { it.copy(live = com.phonecam.camera.LiveValues()) }
         try {
             val codec = if (VideoEncoder.supports(st.settings.codec, mode.width, mode.height)) st.settings.codec
                 else com.phonecam.camera.Codec.H264
@@ -215,9 +269,19 @@ object Streamer {
             updateRotation()
             engine?.open(lens, st.settings, r.cameraSurface)
             Log.i(TAG, "Pipeline ${mode.label} on ${lens.name} (${lens.id})")
+            if (mode.highSpeed) {
+                val id = ++pipelineId
+                h.postDelayed({ if (id == pipelineId) checkHighSpeedStarted(lens, mode) }, HIGH_SPEED_GRACE_MS)
+            } else {
+                pipelineId++
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Pipeline failed", e)
-            fail("Cannot start ${mode.label}: ${e.message}")
+            // Retry like a camera lost mid-stream: the camera service restarts on
+            // its own after a crash, and a hot TECNO CK7n briefly listed no video
+            // encoder at all ("No video/avc encoder for 1920x1080") right after
+            // the thermal step-down, which used to leave the stream stopped for good.
+            cameraFailed("Cannot start ${mode.label}: ${e.message}")
         }
     }
 
@@ -240,10 +304,67 @@ object Streamer {
                 }
             }
             lastSentFrames = frames; lastSentBytes = bytes; lastStatsAt = now
-            if (_state.value.phase != Phase.ERROR && _state.value.live.fps > 0) lastHealthyAt = now
+            if (_state.value.live.fps > 0) {
+                recoveries = 0
+                // Frames are flowing, so a start error is history, whichever path
+                // recovered (retry, settings change, thermal step-down). Seen on a
+                // TECNO CK7n: streaming at 27 fps under a stale "Cannot start" banner.
+                _state.update {
+                    if (it.phase == Phase.ERROR) it.copy(error = null, phase = if (it.pc != null) Phase.STREAMING else Phase.WAITING) else it
+                }
+            }
             s.sendState(stateJson())
         }
         h.postDelayed(::tick, 1000)
+    }
+
+    /**
+     * Some HALs list a high-speed mode they cannot run: a Galaxy S21+ front
+     * camera at 1080p 60 opens, then never delivers a frame, and closing that
+     * session later makes the camera service's watchdog abort it. When a
+     * high-speed mode shows no frames after the grace period, all high-speed
+     * modes of that lens are remembered as broken (they share the session type,
+     * and each failed try costs a camera service restart), dropped from both
+     * UIs, and the stream falls back to 30 fps.
+     */
+    private fun checkHighSpeedStarted(lens: Lens, mode: com.phonecam.camera.VideoMode) {
+        val st = _state.value
+        if (st.phase == Phase.ERROR || st.live.fps > 0f) return
+        val ctx = appContext ?: return
+        Log.w(TAG, "No frames from ${mode.label} on ${lens.name} (${lens.id}); marking its high-speed modes unusable")
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val broken = prefs.getStringSet(KEY_BROKEN_MODES, emptySet()).orEmpty() +
+            lens.modes.filter { it.highSpeed }.map { modeKey(lens.id, it) }
+        prefs.edit().putStringSet(KEY_BROKEN_MODES, broken).apply()
+        val message = "${mode.fps} fps does not work on ${lens.name} on this phone; switched to 30 fps"
+        _state.update { it.copy(lenses = withoutBrokenModes(ctx, it.lenses), error = message) }
+        apply { it.copy(fps = 30) }
+        server?.sendState(hello()) // carries "lenses", so the PC refreshes its mode list
+        handler?.postDelayed({ _state.update { if (it.error == message) it.copy(error = null) else it } }, 10_000)
+    }
+
+    /** True when some modes are hidden as broken, so the UI can offer [showAllModes]. */
+    fun hasHiddenModes(ctx: Context): Boolean =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getStringSet(KEY_BROKEN_MODES, emptySet()).orEmpty().isNotEmpty()
+
+    /** Forgets every mode marked broken, e.g. after a system update fixed the camera. */
+    fun showAllModes(ctx: Context) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_BROKEN_MODES).apply()
+        handler?.post {
+            val lenses = runCatching { CameraCatalog.load(ctx) }.getOrNull() ?: return@post
+            _state.update { it.copy(lenses = lenses) }
+            server?.sendState(hello())
+        }
+    }
+
+    private fun modeKey(lensId: String, m: com.phonecam.camera.VideoMode) = "$lensId:${m.width}x${m.height}@${m.fps}"
+
+    private fun withoutBrokenModes(ctx: Context, lenses: List<Lens>): List<Lens> {
+        val broken = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getStringSet(KEY_BROKEN_MODES, emptySet()).orEmpty()
+        return lenses.map { lens ->
+            val usable = lens.modes.filterNot { modeKey(lens.id, it) in broken }
+            if (usable.isEmpty()) lens else lens.copy(modes = usable)
+        }
     }
 
     private fun fail(message: String) {
@@ -257,14 +378,24 @@ object Streamer {
      * with a frozen stream; after overheating, only once the phone has cooled.
      */
     private fun cameraFailed(message: String) {
+        val h = handler ?: return fail(message)
+        val hot = _state.value.thermal >= android.os.PowerManager.THERMAL_STATUS_SEVERE
+        if (hot) {
+            // A hot phone may refuse the camera or the encoder outright (a TECNO
+            // CK7n at SEVERE listed no video encoder at all), and only cooling
+            // helps: wait for it without a retry limit, saying why.
+            fail("Phone is too hot, waiting for it to cool down. Streaming resumes at 1080p 30 by itself. ($message)")
+            coolDown(reopen = false)
+            h.postDelayed({ if (handler != null && _state.value.phase == Phase.ERROR) openPipeline() }, 15_000L)
+            return
+        }
         fail(message)
-        val h = handler ?: return
-        if (System.nanoTime() - lastHealthyAt > 60_000_000_000L) recoveries = 0
+        // Counts failures since the stream last ran (tick resets it). A crashed
+        // camera service takes 5-10 s to come back, so the waits grow: 2, 4, 6,
+        // 8 and 10 s, about 30 s in all before giving up.
         if (recoveries >= 5) return
         recoveries++
-        val hot = _state.value.thermal >= android.os.PowerManager.THERMAL_STATUS_SEVERE
-        if (hot) coolDown(reopen = false)
-        h.postDelayed({ if (handler != null && _state.value.phase == Phase.ERROR) openPipeline() }, if (hot) 15_000L else 2_000L)
+        h.postDelayed({ if (handler != null && _state.value.phase == Phase.ERROR) openPipeline() }, 2_000L * recoveries)
     }
 
     /** Steps down to the cheapest good-looking mode: 1080p30, manual controls intact. */
@@ -287,6 +418,11 @@ object Streamer {
             handler?.post {
                 _state.update { it.copy(thermal = status) }
                 if (status >= android.os.PowerManager.THERMAL_STATUS_SEVERE) coolDown()
+                else if (_state.value.phase == Phase.ERROR && engine != null) {
+                    // Cooled down while stopped: start again now, with fresh retries.
+                    recoveries = 0
+                    openPipeline()
+                }
                 server?.sendState(stateJson())
             }
         }
@@ -322,7 +458,7 @@ object Streamer {
             OrientationLock.LANDSCAPE -> lastLandscape
             OrientationLock.PORTRAIT -> 0
         }
-        val base = if (baseRotation >= 0) baseRotation else lens.sensorOrientation
+        val base = com.phonecam.stream.Orientation.resolveBase(baseRotation, lens.sensorOrientation, lens.front)
         rotation = com.phonecam.stream.Orientation.streamRotation(base, device, lens.front)
     }
 
@@ -331,6 +467,9 @@ object Streamer {
         .put("device", Build.MODEL)
         .put("manufacturer", Build.MANUFACTURER)
         .put("android", Build.VERSION.RELEASE)
+        // Where the PC can connect back, also when this phone dialled it
+        // and the PC only saw the router's address.
+        .put("address", localIpv4()?.let { "$it:${Protocol.PORT}" } ?: JSONObject.NULL)
         .put("lenses", JSONArray(_state.value.lenses.map { it.toJson() }))
         .put("state", stateJson())
 
@@ -346,7 +485,17 @@ object Streamer {
             .put("error", st.error ?: JSONObject.NULL)
     }
 
-    private fun logCapabilities(lenses: List<Lens>) {
+    private fun logCapabilities(ctx: Context, lenses: List<Lens>) {
         lenses.forEach { Log.i(TAG, "Lens ${it.id} ${it.name}: ${it.toJson()}") }
+        // Vendor effects the phone's own pipeline can apply (bokeh, face retouch,
+        // HDR, night) at no cost to the PC; logged to judge a portrait mode.
+        if (Build.VERSION.SDK_INT >= 31) {
+            val manager = ctx.getSystemService(android.hardware.camera2.CameraManager::class.java)
+            val names = mapOf(0 to "AUTOMATIC", 1 to "FACE_RETOUCH", 2 to "BOKEH", 3 to "HDR", 4 to "NIGHT")
+            lenses.forEach { lens ->
+                val ext = runCatching { manager.getCameraExtensionCharacteristics(lens.id).supportedExtensions }.getOrDefault(emptyList())
+                Log.i(TAG, "Extensions ${lens.id} ${lens.name}: ${ext.map { names[it] ?: "#$it" }.ifEmpty { listOf("none") }}")
+            }
+        }
     }
 }

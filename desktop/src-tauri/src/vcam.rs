@@ -83,13 +83,18 @@ pub fn system_registered() -> bool {
 
 /// Re-runs this executable elevated with `--register-system` (one UAC prompt).
 pub fn register_system_elevated() -> Result<(), String> {
+    run_elevated(w!("--register-system"))
+}
+
+/// Re-runs this executable as administrator with `args` and waits for it.
+pub fn run_elevated(args: PCWSTR) -> Result<(), String> {
     let exe = HSTRING::from(std::env::current_exe().map_err(|e| e.to_string())?.as_os_str());
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
         lpVerb: w!("runas"),
         lpFile: PCWSTR(exe.as_ptr()),
-        lpParameters: w!("--register-system"),
+        lpParameters: args,
         nShow: 0,
         ..Default::default()
     };
@@ -100,7 +105,7 @@ pub fn register_system_elevated() -> Result<(), String> {
         let _ = GetExitCodeProcess(info.hProcess, &mut code);
         let _ = CloseHandle(info.hProcess);
         if code != 0 {
-            return Err(format!("System registration failed (code {code})"));
+            return Err(format!("The administrator step failed (code {code})"));
         }
     }
     Ok(())
